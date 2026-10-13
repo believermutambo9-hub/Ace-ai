@@ -1,0 +1,6 @@
+{
+  "name": "Football Intelligence & Prediction Engine",
+  "description": "Evidence-based worldwide football intelligence, dynamic ratings, statistical modeling, simulation, and backtesting engine.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
