@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: pitchintel-staging-api-v2
+    runtime: node
+    plan: free
+    region: oregon
+    branch: pitchintel-staging-deploy-fix
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: APP_URL
+        value: https://pitchintel-staging-api-v2.onrender.com
+      - key: PITCHINTEL_SERVICE_SECRET
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: pitchintel-staging-db
+          property: connectionString
+
+databases:
+  - name: pitchintel-staging-db
+    plan: free
+    region: oregon
+    databaseName: pitchintel_staging_db
