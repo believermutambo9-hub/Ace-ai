@@ -1,6 +1,10 @@
-import { and, desc, eq } from 'drizzle-orm';
+import { desc, eq } from 'drizzle-orm';
 import { db } from '../../db/index.ts';
-import { competitions, matches, seasons, teams } from '../../db/schema.ts';
+import { competitions, matches, teams } from '../../db/schema.ts';
+import { ApiFootballProvider } from '../providers/apiFootballProvider.ts';
+import { FootballDataProvider } from '../providers/footballDataProvider.ts';
+import { LiveWebFeedProvider, LiveWebScoreboardBundle, LiveWebScoreboardItem } from '../providers/liveWebFeedProvider.ts';
+import { NewsEngine, FootballNewsArticle } from '../news/newsEngine.ts';
 
 export interface LiveEventItem {
   id: string;
@@ -13,22 +17,30 @@ export interface LiveEventItem {
 }
 
 export interface LiveMatchMetadata {
-  minute: number;
-  period: '1H' | 'HT' | '2H' | 'FT';
+  minute: number | null;
+  period: '1H' | 'HT' | '2H' | 'ET' | 'FT' | 'LIVE';
   stoppageTime?: number;
+  displayClock?: string;
   lastUpdated: string;
+  providerSource?: string;
   events: LiveEventItem[];
   lastEvent?: LiveEventItem;
-  liveStats: {
-    possession: { home: number; away: number };
-    shots: { home: number; away: number };
-    shotsOnTarget: { home: number; away: number };
-    corners: { home: number; away: number };
-    fouls: { home: number; away: number };
-    yellowCards: { home: number; away: number };
-    redCards: { home: number; away: number };
-    liveXg: { home: number; away: number };
-    pitchTilt: { home: number; away: number };
+  liveStats?: {
+    possession?: { home: number; away: number };
+    shots?: { home: number; away: number };
+    shotsOnTarget?: { home: number; away: number };
+    corners?: { home: number; away: number };
+    fouls?: { home: number; away: number };
+    yellowCards?: { home: number; away: number };
+    redCards?: { home: number; away: number };
+    liveXg?: { home: number; away: number };
+    pitchTilt?: { home: number; away: number };
+  };
+  moneylineOdds?: {
+    home?: number;
+    draw?: number;
+    away?: number;
+    provider?: string;
   };
   inPlayProbabilities: {
     homeWin: number;
@@ -37,618 +49,457 @@ export interface LiveMatchMetadata {
   };
 }
 
+export interface LiveWebFeedSnapshot {
+  status: 'OPERATIONAL' | 'DEGRADED';
+  lastUpdated: string;
+  latencyMs: number;
+  leaguesCovered: number;
+  liveMatches: any[];
+  upcomingToday: LiveWebScoreboardItem[];
+  recentResults: LiveWebScoreboardItem[];
+  dispatches: FootballNewsArticle[];
+  feedSources: Array<{
+    id: string;
+    name: string;
+    status: 'OPERATIONAL' | 'STANDBY' | 'OFFLINE';
+    detail: string;
+  }>;
+}
+
+/**
+ * Live Football Engine
+ * Responsible for tracking, querying, and updating verified in-play fixtures across
+ * Football-Data.org, API-Football (when healthy), the key-free Live Web Feed (ESPN Scorepanel),
+ * and PostgreSQL persisted in-play fixtures.
+ * CRITICAL RULE: Never invents scores, fake goal scorers, fake xG, or arbitrary minute stamps.
+ */
 export class LiveMatchEngine {
-  private static lastTickTimestamp: number = Date.now();
-  private static isTicking: boolean = false;
+  private static cachedLiveMatches: any[] = [];
+  private static lastCacheTime: number = 0;
+  private static readonly CACHE_TTL_MS = 15000;
 
-  /**
-   * Ensure there are active LIVE matches in the database. If none, seeds 4 worldwide matches.
-   */
-  public static async ensureLiveMatches(): Promise<void> {
-    try {
-      const activeLive = await db
-        .select()
-        .from(matches)
-        .where(eq(matches.status, 'LIVE'));
+  private static normalizePairKey(home: string, away: string): string {
+    const clean = (s: string) =>
+      s
+        .toLowerCase()
+        .replace(/\b(fc|cf|sc|ac|afc|united|city)\b/g, '')
+        .replace(/[^a-z0-9]/g, '')
+        .slice(0, 10);
+    return `${clean(home)}__${clean(away)}`;
+  }
 
-      if (activeLive.length >= 3) {
-        return;
-      }
-
-      // Query necessary teams
-      const allTeams = await db.select().from(teams);
-      const teamMap = new Map(allTeams.map((t) => [t.canonicalName, t.id]));
-
-      const getTeamId = (name: string, fallbackId: number) => teamMap.get(name) || fallbackId;
-
-      const liveFixturesConfig = [
-        {
-          extId: 'live_pl_ars_mci',
-          compCode: 'PL',
-          homeName: 'Arsenal FC',
-          homeId: getTeamId('Arsenal FC', 1),
-          awayName: 'Manchester City FC',
-          awayId: getTeamId('Manchester City FC', 3),
-          minute: 68,
-          period: '2H' as const,
-          homeScore: 2,
-          awayScore: 1,
-          venue: 'Emirates Stadium',
-          events: [
-            {
-              id: 'ev_1',
-              minute: 22,
-              type: 'GOAL' as const,
-              team: 'HOME' as const,
-              player: 'Bukayo Saka',
-              scoreAfter: '1-0',
-              description: 'Left footed shot from inside the box to bottom left corner.',
-            },
-            {
-              id: 'ev_2',
-              minute: 39,
-              type: 'GOAL' as const,
-              team: 'AWAY' as const,
-              player: 'Erling Haaland',
-              scoreAfter: '1-1',
-              description: 'Header from 6 yards out following a pinpoint cross.',
-            },
-            {
-              id: 'ev_3',
-              minute: 59,
-              type: 'GOAL' as const,
-              team: 'HOME' as const,
-              player: 'Kai Havertz',
-              scoreAfter: '2-1',
-              description: 'Right footed volley deflected into the top right corner.',
-            },
-            {
-              id: 'ev_4',
-              minute: 65,
-              type: 'YELLOW_CARD' as const,
-              team: 'AWAY' as const,
-              player: 'Rodri',
-              description: 'Tactical foul breaking up a fast counter-attack.',
-            },
-          ],
-          liveStats: {
-            possession: { home: 49, away: 51 },
-            shots: { home: 11, away: 9 },
-            shotsOnTarget: { home: 5, away: 4 },
-            corners: { home: 5, away: 4 },
-            fouls: { home: 9, away: 11 },
-            yellowCards: { home: 1, away: 2 },
-            redCards: { home: 0, away: 0 },
-            liveXg: { home: 1.74, away: 1.28 },
-            pitchTilt: { home: 52, away: 48 },
-          },
-        },
-        {
-          extId: 'live_cl_rma_bay',
-          compCode: 'CL',
-          homeName: 'Real Madrid CF',
-          homeId: getTeamId('Real Madrid CF', 11),
-          awayName: 'FC Bayern München',
-          awayId: getTeamId('FC Bayern München', 21),
-          minute: 34,
-          period: '1H' as const,
-          homeScore: 1,
-          awayScore: 0,
-          venue: 'Santiago Bernabéu',
-          events: [
-            {
-              id: 'ev_11',
-              minute: 14,
-              type: 'GOAL' as const,
-              team: 'HOME' as const,
-              player: 'Vinícius Júnior',
-              scoreAfter: '1-0',
-              description: 'Clinical low finish across the goalkeeper into bottom right.',
-            },
-            {
-              id: 'ev_12',
-              minute: 27,
-              type: 'YELLOW_CARD' as const,
-              team: 'AWAY' as const,
-              player: 'Joshua Kimmich',
-              description: 'Late sliding challenge in the central third.',
-            },
-          ],
-          liveStats: {
-            possession: { home: 54, away: 46 },
-            shots: { home: 6, away: 3 },
-            shotsOnTarget: { home: 3, away: 1 },
-            corners: { home: 3, away: 2 },
-            fouls: { home: 4, away: 6 },
-            yellowCards: { home: 0, away: 1 },
-            redCards: { home: 0, away: 0 },
-            liveXg: { home: 0.92, away: 0.35 },
-            pitchTilt: { home: 58, away: 42 },
-          },
-        },
-        {
-          extId: 'live_pd_bar_atm',
-          compCode: 'PD',
-          homeName: 'FC Barcelona',
-          homeId: getTeamId('FC Barcelona', 12),
-          awayName: 'Atlético de Madrid',
-          awayId: getTeamId('Atlético de Madrid', 13),
-          minute: 81,
-          period: '2H' as const,
-          homeScore: 1,
-          awayScore: 1,
-          venue: 'Estadi Olímpic Lluís Companys',
-          events: [
-            {
-              id: 'ev_21',
-              minute: 31,
-              type: 'GOAL' as const,
-              team: 'HOME' as const,
-              player: 'Lamine Yamal',
-              scoreAfter: '1-0',
-              description: 'Sensational curled effort from outside the 18-yard box.',
-            },
-            {
-              id: 'ev_22',
-              minute: 73,
-              type: 'GOAL' as const,
-              team: 'AWAY' as const,
-              player: 'Antoine Griezmann',
-              scoreAfter: '1-1',
-              description: 'Chipped finish over the advancing goalkeeper on the break.',
-            },
-          ],
-          liveStats: {
-            possession: { home: 62, away: 38 },
-            shots: { home: 14, away: 7 },
-            shotsOnTarget: { home: 6, away: 3 },
-            corners: { home: 8, away: 3 },
-            fouls: { home: 7, away: 14 },
-            yellowCards: { home: 1, away: 3 },
-            redCards: { home: 0, away: 0 },
-            liveXg: { home: 1.88, away: 0.94 },
-            pitchTilt: { home: 66, away: 34 },
-          },
-        },
-        {
-          extId: 'live_sa_int_juv',
-          compCode: 'SA',
-          homeName: 'Inter Milan',
-          homeId: getTeamId('Inter Milan', 18),
-          awayName: 'Juventus FC',
-          awayId: getTeamId('Juventus FC', 18),
-          minute: 52,
-          period: '2H' as const,
-          homeScore: 0,
-          awayScore: 0,
-          venue: 'San Siro',
-          events: [
-            {
-              id: 'ev_31',
-              minute: 19,
-              type: 'YELLOW_CARD' as const,
-              team: 'HOME' as const,
-              player: 'Nicolò Barella',
-              description: 'Dissent after a referee foul decision.',
-            },
-            {
-              id: 'ev_32',
-              minute: 44,
-              type: 'VAR_CHECK' as const,
-              team: 'AWAY' as const,
-              player: 'Dušan Vlahović',
-              description: 'VAR review confirms offside; goal disallowed.',
-            },
-          ],
-          liveStats: {
-            possession: { home: 51, away: 49 },
-            shots: { home: 7, away: 6 },
-            shotsOnTarget: { home: 2, away: 2 },
-            corners: { home: 4, away: 3 },
-            fouls: { home: 10, away: 11 },
-            yellowCards: { home: 2, away: 1 },
-            redCards: { home: 0, away: 0 },
-            liveXg: { home: 0.65, away: 0.58 },
-            pitchTilt: { home: 50, away: 50 },
-          },
-        },
-      ];
-
-      for (const fix of liveFixturesConfig) {
-        const [comp] = await db
-          .select()
-          .from(competitions)
-          .where(eq(competitions.code, fix.compCode))
-          .limit(1);
-
-        const [season] = await db
-          .select()
-          .from(seasons)
-          .where(eq(seasons.competitionId, comp ? comp.id : 1))
-          .limit(1);
-
-        const inPlay = LiveMatchEngine.calculateInPlayProbabilities(
-          fix.homeScore,
-          fix.awayScore,
-          fix.minute
-        );
-
-        const meta: LiveMatchMetadata = {
-          minute: fix.minute,
-          period: fix.period,
-          lastUpdated: new Date().toISOString(),
-          events: fix.events,
-          lastEvent: fix.events[fix.events.length - 1],
-          liveStats: fix.liveStats,
-          inPlayProbabilities: inPlay,
-        };
-
-        // Check if existing
-        const [existing] = await db
-          .select()
-          .from(matches)
-          .where(eq(matches.externalId, fix.extId))
-          .limit(1);
-
-        if (!existing) {
-          await db.insert(matches).values({
-            providerSource: 'live-engine',
-            externalId: fix.extId,
-            competitionId: comp ? comp.id : 1,
-            seasonId: season ? season.id : 1,
-            round: 'Matchday 8 (Live in Progress)',
-            kickoffTime: new Date(Date.now() - fix.minute * 60 * 1000),
-            homeTeamId: fix.homeId,
-            awayTeamId: fix.awayId,
-            venue: fix.venue,
-            status: 'LIVE',
-            homeScoreFullTime: fix.homeScore,
-            awayScoreFullTime: fix.awayScore,
-            metadata: meta,
-          });
-        }
-      }
-    } catch (err: any) {
-      console.warn('[LiveMatchEngine] Initial setup notice:', err?.message || err);
+  private static estimateElapsedForProbability(kickoffTime: Date, reportedMinute: number | null): number {
+    if (reportedMinute !== null && reportedMinute >= 0 && reportedMinute <= 130) {
+      return reportedMinute;
     }
+    const elapsedMins = Math.round((Date.now() - kickoffTime.getTime()) / 60000);
+    if (elapsedMins <= 0) return 1;
+    if (elapsedMins <= 45) return elapsedMins;
+    if (elapsedMins <= 60) return 45;
+    return Math.min(90, elapsedMins - 15);
+  }
+
+  private static mapWebScoreboardItemToLiveMatch(item: LiveWebScoreboardItem, idx: number): any {
+    const homeScore = item.homeScoreFullTime ?? 0;
+    const awayScore = item.awayScoreFullTime ?? 0;
+    const kickoffDate = new Date(item.kickoffTime);
+    const mathMinute = this.estimateElapsedForProbability(kickoffDate, item.minute);
+    const inPlay = this.calculateInPlayProbabilities(homeScore, awayScore, mathMinute);
+    const period: LiveMatchMetadata['period'] =
+      item.period === 'PRE' ? 'LIVE' : item.period;
+
+    return {
+      id: 970000 + idx,
+      isDatabaseMatch: false,
+      externalId: item.externalId,
+      competitionId: 0,
+      competitionName: item.competitionName,
+      competitionCode: item.competitionCode,
+      round: item.round || 'In Play',
+      kickoffTime: item.kickoffTime,
+      status: 'LIVE',
+      homeTeam: item.homeTeam,
+      awayTeam: item.awayTeam,
+      homeShortName: item.homeShortName,
+      awayShortName: item.awayShortName,
+      homeScoreFullTime: homeScore,
+      awayScoreFullTime: awayScore,
+      result: item.result,
+      venue: item.venue || 'Stadium',
+      metadata: {
+        minute: item.minute,
+        ...(item.stoppageTime !== undefined ? { stoppageTime: item.stoppageTime } : {}),
+        period,
+        displayClock: item.displayClock,
+        lastUpdated: new Date().toISOString(),
+        providerSource: item.providerSource,
+        events: item.events,
+        lastEvent: item.events[item.events.length - 1],
+        ...(item.liveStats ? { liveStats: item.liveStats } : {}),
+        ...(item.moneylineOdds ? { moneylineOdds: item.moneylineOdds } : {}),
+        inPlayProbabilities: inPlay,
+      },
+    };
   }
 
   /**
-   * Advance live matches dynamically by elapsed time
+   * Retrieve all currently verified LIVE matches.
+   * Cascades cleanly across healthy API-Football, Football-Data.org, key-free Live Web Feed,
+   * and PostgreSQL in-play fixtures without stalling on broken/suspended keys.
    */
-  public static async tickLiveMatches(): Promise<void> {
-    if (this.isTicking) return;
-    this.isTicking = true;
+  public static async getLiveMatches(forceRefresh = false): Promise<any[]> {
+    const now = Date.now();
+    if (!forceRefresh && this.cachedLiveMatches.length > 0 && now - this.lastCacheTime < this.CACHE_TTL_MS) {
+      return this.cachedLiveMatches;
+    }
 
     try {
-      const now = Date.now();
-      const deltaSec = Math.floor((now - this.lastTickTimestamp) / 1000);
-      // Advance approximately 1 match minute every 6 real-world seconds
-      const minutesToAdvance = Math.max(1, Math.floor(deltaSec / 6));
+      const liveList: any[] = [];
+      const seenExternalIds = new Set<string>();
+      const pairIndexMap = new Map<string, number>();
 
-      if (deltaSec < 3) {
-        this.isTicking = false;
-        return;
+      const pushOrMergeLive = (candidate: any) => {
+        if (seenExternalIds.has(candidate.externalId)) return;
+        const pairKey = this.normalizePairKey(candidate.homeTeam || '', candidate.awayTeam || '');
+        const existingIdx = pairIndexMap.get(pairKey);
+
+        if (existingIdx !== undefined) {
+          const existing = liveList[existingIdx];
+          // Enrich missing minute, events, or liveStats from the newer source without losing DB ID
+          const mergedMeta = {
+            ...existing.metadata,
+            minute: existing.metadata?.minute ?? candidate.metadata?.minute ?? null,
+            stoppageTime: existing.metadata?.stoppageTime ?? candidate.metadata?.stoppageTime,
+            displayClock: existing.metadata?.displayClock ?? candidate.metadata?.displayClock,
+            period:
+              existing.metadata?.period && existing.metadata.period !== 'LIVE'
+                ? existing.metadata.period
+                : candidate.metadata?.period || 'LIVE',
+            events:
+              existing.metadata?.events?.length > 0
+                ? existing.metadata.events
+                : candidate.metadata?.events || [],
+            liveStats: existing.metadata?.liveStats || candidate.metadata?.liveStats,
+            moneylineOdds: existing.metadata?.moneylineOdds || candidate.metadata?.moneylineOdds,
+          };
+          liveList[existingIdx] = {
+            ...existing,
+            metadata: mergedMeta,
+          };
+          return;
+        }
+
+        seenExternalIds.add(candidate.externalId);
+        pairIndexMap.set(pairKey, liveList.length);
+        liveList.push(candidate);
+      };
+
+      // 1. Try API-Football v3 ONLY if configured & not in suspension/cooldown
+      if (process.env.API_FOOTBALL_KEY && !ApiFootballProvider.isInCircuitBreakerCooldown()) {
+        try {
+          const apiFootball = new ApiFootballProvider();
+          const rawLive = await apiFootball.fetchLiveMatches();
+          if (Array.isArray(rawLive) && rawLive.length > 0) {
+            rawLive.forEach((m, idx) => {
+              const homeScore = m.homeScoreFullTime ?? 0;
+              const awayScore = m.awayScoreFullTime ?? 0;
+              const reportedMinute = typeof m.metadata?.elapsed === 'number' ? m.metadata.elapsed : null;
+              const mathMinute = this.estimateElapsedForProbability(m.kickoffTime, reportedMinute);
+              const inPlay = this.calculateInPlayProbabilities(homeScore, awayScore, mathMinute);
+              const statusShort = (m.metadata?.statusShort as string) || '';
+              const period: LiveMatchMetadata['period'] =
+                statusShort === 'HT'
+                  ? 'HT'
+                  : statusShort === '2H'
+                  ? '2H'
+                  : statusShort === '1H'
+                  ? '1H'
+                  : statusShort === 'ET'
+                  ? 'ET'
+                  : reportedMinute !== null
+                  ? reportedMinute > 45
+                    ? '2H'
+                    : '1H'
+                  : 'LIVE';
+
+              pushOrMergeLive({
+                id: (m.metadata?.apiFootballId as number) || 900000 + idx,
+                isDatabaseMatch: false,
+                externalId: m.externalId,
+                competitionId: 0,
+                competitionName: m.metadata?.leagueName || m.competitionCode || 'Live Competition',
+                competitionCode: m.competitionCode || 'LIVE',
+                round: m.round || 'In Play',
+                kickoffTime: m.kickoffTime.toISOString(),
+                status: 'LIVE',
+                homeTeam: m.homeTeamRawName,
+                awayTeam: m.awayTeamRawName,
+                homeShortName: m.homeTeamRawName.slice(0, 3).toUpperCase(),
+                awayShortName: m.awayTeamRawName.slice(0, 3).toUpperCase(),
+                homeScoreFullTime: homeScore,
+                awayScoreFullTime: awayScore,
+                result: m.result,
+                venue: m.venue || 'Stadium',
+                metadata: {
+                  minute: reportedMinute,
+                  period,
+                  lastUpdated: new Date().toISOString(),
+                  providerSource: 'api-football-v3',
+                  events: [],
+                  inPlayProbabilities: inPlay,
+                },
+              });
+            });
+          }
+        } catch (err: any) {
+          console.warn('[LiveMatchEngine] API-Football live fetch notice:', err?.message);
+        }
       }
-      this.lastTickTimestamp = now;
 
-      const liveList = await db
-        .select()
-        .from(matches)
-        .where(eq(matches.status, 'LIVE'));
+      // 2. Query Football-Data.org live matches + Live Web Feed in parallel for broad zero-error coverage
+      const [fdLiveResult, webLiveResult, dbLiveMatches] = await Promise.all([
+        process.env.FOOTBALL_DATA_API_KEY
+          ? new FootballDataProvider().fetchLiveMatches().catch(() => [])
+          : Promise.resolve([]),
+        new LiveWebFeedProvider().fetchLiveMatches().catch(() => []),
+        db
+          .select({
+            id: matches.id,
+            externalId: matches.externalId,
+            competitionId: matches.competitionId,
+            competitionName: competitions.name,
+            competitionCode: competitions.code,
+            round: matches.round,
+            kickoffTime: matches.kickoffTime,
+            status: matches.status,
+            homeTeamId: matches.homeTeamId,
+            awayTeamId: matches.awayTeamId,
+            homeScoreFullTime: matches.homeScoreFullTime,
+            awayScoreFullTime: matches.awayScoreFullTime,
+            result: matches.result,
+            venue: matches.venue,
+            metadata: matches.metadata,
+          })
+          .from(matches)
+          .innerJoin(competitions, eq(matches.competitionId, competitions.id))
+          .where(eq(matches.status, 'LIVE'))
+          .orderBy(desc(matches.kickoffTime)),
+      ]);
 
-      if (liveList.length === 0) {
-        await this.ensureLiveMatches();
-        this.isTicking = false;
-        return;
-      }
+      // Add Football-Data.org live matches
+      if (Array.isArray(fdLiveResult) && fdLiveResult.length > 0) {
+        fdLiveResult.forEach((m, idx) => {
+          const homeScore = m.homeScoreFullTime ?? 0;
+          const awayScore = m.awayScoreFullTime ?? 0;
+          const mathMinute = this.estimateElapsedForProbability(m.kickoffTime, null);
+          const inPlay = this.calculateInPlayProbabilities(homeScore, awayScore, mathMinute);
 
-      for (const m of liveList) {
-        const meta = (m.metadata as LiveMatchMetadata) || {
-          minute: 10,
-          period: '1H',
-          lastUpdated: new Date().toISOString(),
-          events: [],
-          liveStats: {
-            possession: { home: 50, away: 50 },
-            shots: { home: 3, away: 2 },
-            shotsOnTarget: { home: 1, away: 1 },
-            corners: { home: 1, away: 1 },
-            fouls: { home: 3, away: 3 },
-            yellowCards: { home: 0, away: 0 },
-            redCards: { home: 0, away: 0 },
-            liveXg: { home: 0.35, away: 0.28 },
-            pitchTilt: { home: 50, away: 50 },
-          },
-          inPlayProbabilities: { homeWin: 0.45, draw: 0.30, awayWin: 0.25 },
-        };
-
-        let currentMinute = meta.minute + minutesToAdvance;
-        let currentPeriod = meta.period;
-        let homeScore = m.homeScoreFullTime ?? 0;
-        let awayScore = m.awayScoreFullTime ?? 0;
-        const events = [...(meta.events || [])];
-        const stats = { ...meta.liveStats };
-
-        // Handle half-time transition
-        if (currentMinute >= 45 && currentPeriod === '1H') {
-          currentPeriod = 'HT';
-          currentMinute = 45;
-        } else if (currentPeriod === 'HT') {
-          currentPeriod = '2H';
-          currentMinute = 46;
-        }
-
-        // Random in-match developments based on Poisson probability per minute
-        // Poisson chance of goal in 1 minute ~ 0.03
-        if (currentPeriod !== 'HT' && currentMinute <= 92) {
-          // Increment shots / corners
-          if (Math.random() < 0.35) {
-            if (Math.random() > 0.5) {
-              stats.shots.home += 1;
-              stats.liveXg.home = Number((stats.liveXg.home + (0.05 + Math.random() * 0.12)).toFixed(2));
-              if (Math.random() > 0.55) stats.shotsOnTarget.home += 1;
-            } else {
-              stats.shots.away += 1;
-              stats.liveXg.away = Number((stats.liveXg.away + (0.04 + Math.random() * 0.11)).toFixed(2));
-              if (Math.random() > 0.55) stats.shotsOnTarget.away += 1;
-            }
-          }
-
-          // Goal event check (approx 4% chance per tick)
-          if (Math.random() < 0.06 && currentMinute < 90) {
-            const isHomeGoal = Math.random() > 0.48;
-            if (isHomeGoal) {
-              homeScore += 1;
-              const scorerPool = ['B. Saka', 'K. Havertz', 'V. Júnior', 'L. Yamal', 'L. Martínez', 'M. Salah', 'Rodrygo'];
-              const scorer = scorerPool[Math.floor(Math.random() * scorerPool.length)];
-              const newEv: LiveEventItem = {
-                id: `ev_goal_${Date.now()}`,
-                minute: currentMinute,
-                type: 'GOAL',
-                team: 'HOME',
-                player: scorer,
-                scoreAfter: `${homeScore}-${awayScore}`,
-                description: `GOAL! ${scorer} finishes brilliantly into the net.`,
-              };
-              events.push(newEv);
-              meta.lastEvent = newEv;
-              stats.liveXg.home = Number((stats.liveXg.home + 0.42).toFixed(2));
-            } else {
-              awayScore += 1;
-              const scorerPool = ['E. Haaland', 'A. Griezmann', 'H. Kane', 'D. Vlahović', 'K. De Bruyne', 'L. Sané'];
-              const scorer = scorerPool[Math.floor(Math.random() * scorerPool.length)];
-              const newEv: LiveEventItem = {
-                id: `ev_goal_${Date.now()}`,
-                minute: currentMinute,
-                type: 'GOAL',
-                team: 'AWAY',
-                player: scorer,
-                scoreAfter: `${homeScore}-${awayScore}`,
-                description: `GOAL! ${scorer} strikes past the keeper from the edge of the box.`,
-              };
-              events.push(newEv);
-              meta.lastEvent = newEv;
-              stats.liveXg.away = Number((stats.liveXg.away + 0.38).toFixed(2));
-            }
-          }
-
-          // Card event check (approx 5% chance)
-          if (Math.random() < 0.05) {
-            const isHomeCard = Math.random() > 0.5;
-            const newCard: LiveEventItem = {
-              id: `ev_card_${Date.now()}`,
-              minute: currentMinute,
-              type: 'YELLOW_CARD',
-              team: isHomeCard ? 'HOME' : 'AWAY',
-              player: isHomeCard ? 'Home Midfielder' : 'Away Defender',
-              description: 'Cautioned by the referee for a tactical foul.',
-            };
-            events.push(newCard);
-            meta.lastEvent = newCard;
-            if (isHomeCard) stats.yellowCards.home += 1;
-            else stats.yellowCards.away += 1;
-          }
-        }
-
-        // Full time finish check
-        if (currentMinute >= 93) {
-          const result = homeScore > awayScore ? 'HOME_WIN' : homeScore < awayScore ? 'AWAY_WIN' : 'DRAW';
-          await db
-            .update(matches)
-            .set({
-              status: 'FINISHED',
-              homeScoreFullTime: homeScore,
-              awayScoreFullTime: awayScore,
-              result,
-              metadata: {
-                ...meta,
-                minute: 90,
-                period: 'FT',
-                lastUpdated: new Date().toISOString(),
-                events,
-                liveStats: stats,
-              },
-            })
-            .where(eq(matches.id, m.id));
-          continue;
-        }
-
-        // Recalculate dynamic in-play win probabilities
-        const updatedInPlay = LiveMatchEngine.calculateInPlayProbabilities(homeScore, awayScore, currentMinute);
-
-        const updatedMetadata: LiveMatchMetadata = {
-          minute: currentMinute,
-          period: currentPeriod,
-          lastUpdated: new Date().toISOString(),
-          events,
-          lastEvent: meta.lastEvent,
-          liveStats: stats,
-          inPlayProbabilities: updatedInPlay,
-        };
-
-        await db
-          .update(matches)
-          .set({
+          pushOrMergeLive({
+            id: 950000 + idx,
+            isDatabaseMatch: false,
+            externalId: m.externalId,
+            competitionId: 0,
+            competitionName: m.competitionCode || 'Live League',
+            competitionCode: m.competitionCode || 'LIVE',
+            round: m.round || 'In Play',
+            kickoffTime: m.kickoffTime.toISOString(),
+            status: 'LIVE',
+            homeTeam: m.homeTeamRawName,
+            awayTeam: m.awayTeamRawName,
+            homeShortName: m.homeTeamRawName.slice(0, 3).toUpperCase(),
+            awayShortName: m.awayTeamRawName.slice(0, 3).toUpperCase(),
             homeScoreFullTime: homeScore,
             awayScoreFullTime: awayScore,
-            metadata: updatedMetadata,
-          })
-          .where(eq(matches.id, m.id));
+            result: m.result,
+            venue: m.venue || 'Stadium',
+            metadata: {
+              minute: null,
+              period: 'LIVE' as const,
+              lastUpdated: new Date().toISOString(),
+              providerSource: 'football-data-org',
+              events: [],
+              inPlayProbabilities: inPlay,
+            },
+          });
+        });
       }
+
+      // Add / merge Live Web Feed matches (real clocks, events, and team stats)
+      if (Array.isArray(webLiveResult) && webLiveResult.length > 0) {
+        webLiveResult.forEach((item, idx) => {
+          pushOrMergeLive(this.mapWebScoreboardItemToLiveMatch(item, idx));
+        });
+      }
+
+      // Supplement / merge PostgreSQL live fixtures if any
+      if (dbLiveMatches.length > 0) {
+        const allTeams = await db.select().from(teams);
+        const teamMap = new Map(allTeams.map((t) => [t.id, t]));
+
+        dbLiveMatches.forEach((m) => {
+          const meta = (m.metadata as any)?.liveData as LiveMatchMetadata | undefined;
+          const currentHomeScore = m.homeScoreFullTime ?? 0;
+          const currentAwayScore = m.awayScoreFullTime ?? 0;
+          const reportedMinute = typeof meta?.minute === 'number' ? meta.minute : null;
+          const mathMinute = this.estimateElapsedForProbability(new Date(m.kickoffTime), reportedMinute);
+          const inPlay = this.calculateInPlayProbabilities(currentHomeScore, currentAwayScore, mathMinute);
+
+          pushOrMergeLive({
+            ...m,
+            isDatabaseMatch: true,
+            homeTeam: teamMap.get(m.homeTeamId)?.canonicalName || 'Home Team',
+            awayTeam: teamMap.get(m.awayTeamId)?.canonicalName || 'Away Team',
+            homeShortName: teamMap.get(m.homeTeamId)?.shortName || 'Home',
+            awayShortName: teamMap.get(m.awayTeamId)?.shortName || 'Away',
+            metadata: {
+              minute: reportedMinute,
+              period: meta?.period || (reportedMinute !== null ? (reportedMinute > 45 ? '2H' : '1H') : 'LIVE'),
+              lastUpdated: new Date().toISOString(),
+              providerSource: 'postgresql-verified',
+              events: meta?.events || [],
+              ...(meta?.liveStats ? { liveStats: meta.liveStats } : {}),
+              inPlayProbabilities: inPlay,
+            },
+          });
+        });
+      }
+
+      this.cachedLiveMatches = liveList;
+      this.lastCacheTime = now;
+      return liveList;
     } catch (err: any) {
-      console.warn('[LiveMatchEngine] Tick error:', err?.message || err);
-    } finally {
-      this.isTicking = false;
+      console.warn('[LiveMatchEngine] Query error:', err?.message || err);
+      return [];
     }
   }
 
   /**
-   * Calculate live In-Play Win/Draw/Away probabilities using score and time remaining
+   * Unified Live Web Feed Snapshot for Engine & Live Dashboard
+   * Aggregates verified live scores, today's global web scoreboard, news dispatches, and source health cleanly.
+   */
+  public static async getLiveWebFeedSnapshot(forceRefresh = false): Promise<LiveWebFeedSnapshot> {
+    const start = Date.now();
+    const webProvider = new LiveWebFeedProvider();
+
+    const [bundleRes, liveMatches, newsRes] = await Promise.all([
+      webProvider.fetchWebScoreboardBundle(forceRefresh).catch((): LiveWebScoreboardBundle | null => null),
+      this.getLiveMatches(forceRefresh),
+      NewsEngine.getFootballNews('ALL').catch(() => ({
+        articles: [] as FootballNewsArticle[],
+        sourceCount: 0,
+        activeSources: [] as string[],
+        failedSources: [] as Array<{ source: string; reason: string }>,
+        lastRetrieved: new Date().toISOString(),
+        isFresh: false,
+      })),
+    ]);
+
+    const feedSources: LiveWebFeedSnapshot['feedSources'] = [
+      {
+        id: 'live-web-feed',
+        name: 'Global Live Web Scoreboard',
+        status: bundleRes ? 'OPERATIONAL' : 'OFFLINE',
+        detail: bundleRes
+          ? `${bundleRes.leaguesCovered} leagues • ${bundleRes.live.length} live • ${bundleRes.upcoming.length} upcoming`
+          : 'Scoreboard feed temporarily unreachable',
+      },
+      {
+        id: 'football-data-org',
+        name: 'Football-Data.org Live Stream',
+        status: process.env.FOOTBALL_DATA_API_KEY ? 'OPERATIONAL' : 'STANDBY',
+        detail: process.env.FOOTBALL_DATA_API_KEY
+          ? 'Authenticated API v4 stream active'
+          : 'No FOOTBALL_DATA_API_KEY configured',
+      },
+      {
+        id: 'api-football-v3',
+        name: 'API-Football v3 Live Stream',
+        status: !process.env.API_FOOTBALL_KEY
+          ? 'STANDBY'
+          : ApiFootballProvider.isInCircuitBreakerCooldown()
+          ? 'STANDBY'
+          : 'OPERATIONAL',
+        detail: !process.env.API_FOOTBALL_KEY
+          ? 'No API_FOOTBALL_KEY configured'
+          : ApiFootballProvider.isInCircuitBreakerCooldown()
+          ? 'Paused via circuit-breaker cooldown (fallback active)'
+          : 'API-Sports live stream enabled',
+      },
+      {
+        id: 'web-intelligence',
+        name: 'Football Web & RSS Dispatches',
+        status: newsRes.activeSources.length > 0 ? 'OPERATIONAL' : 'OFFLINE',
+        detail:
+          newsRes.activeSources.length > 0
+            ? `${newsRes.activeSources.length} active feeds (${newsRes.articles.length} articles)`
+            : 'No dispatch feeds reachable',
+      },
+    ];
+
+    return {
+      status: bundleRes || liveMatches.length > 0 || newsRes.activeSources.length > 0 ? 'OPERATIONAL' : 'DEGRADED',
+      lastUpdated: new Date().toISOString(),
+      latencyMs: Date.now() - start,
+      leaguesCovered: bundleRes?.leaguesCovered ?? 0,
+      liveMatches,
+      upcomingToday: (bundleRes?.upcoming ?? []).slice(0, 18),
+      recentResults: (bundleRes?.finished ?? []).slice(0, 12),
+      dispatches: (newsRes.articles ?? []).slice(0, 8),
+      feedSources,
+    };
+  }
+
+  /**
+   * Mathematical In-Play Probability Engine
+   * Calculates remaining Poisson expectations conditioned on current scoreline and elapsed time.
    */
   public static calculateInPlayProbabilities(
     homeScore: number,
     awayScore: number,
     minute: number
   ): { homeWin: number; draw: number; awayWin: number } {
-    const minClamped = Math.min(90, Math.max(0, minute));
-    const timeRemainingFraction = (90 - minClamped) / 90;
-    const goalDiff = homeScore - awayScore;
+    const remainingFraction = Math.max(0, (90 - minute) / 90);
 
-    let pHome: number;
-    let pDraw: number;
-    let pAway: number;
+    // Baseline goal rates per 90 mins for typical competitive fixture (~1.45 home, ~1.15 away)
+    const remainingLambdaHome = 1.45 * remainingFraction;
+    const remainingLambdaAway = 1.15 * remainingFraction;
 
-    if (goalDiff === 0) {
-      // Level score: Draw probability increases as time ticks down
-      pDraw = Number((0.28 + (1 - timeRemainingFraction) * 0.54).toFixed(3));
-      const remaining = 1 - pDraw;
-      pHome = Number((remaining * 0.53).toFixed(3));
-      pAway = Number((remaining * 0.47).toFixed(3));
-    } else if (goalDiff === 1) {
-      // Home leading by 1
-      pHome = Number((0.55 + (1 - timeRemainingFraction) * 0.40).toFixed(3));
-      const rem = 1 - pHome;
-      pDraw = Number((rem * 0.68).toFixed(3));
-      pAway = Number((rem * 0.32).toFixed(3));
-    } else if (goalDiff === -1) {
-      // Away leading by 1
-      pAway = Number((0.52 + (1 - timeRemainingFraction) * 0.42).toFixed(3));
-      const rem = 1 - pAway;
-      pDraw = Number((rem * 0.68).toFixed(3));
-      pHome = Number((rem * 0.32).toFixed(3));
-    } else if (goalDiff >= 2) {
-      // Home leading by 2+
-      pHome = Number((0.85 + (1 - timeRemainingFraction) * 0.14).toFixed(3));
-      const rem = 1 - pHome;
-      pDraw = Number((rem * 0.80).toFixed(3));
-      pAway = Number((rem * 0.20).toFixed(3));
-    } else {
-      // Away leading by 2+
-      pAway = Number((0.82 + (1 - timeRemainingFraction) * 0.16).toFixed(3));
-      const rem = 1 - pAway;
-      pDraw = Number((rem * 0.80).toFixed(3));
-      pHome = Number((rem * 0.20).toFixed(3));
+    let pHomeWin = 0;
+    let pDraw = 0;
+    let pAwayWin = 0;
+
+    // Convolve bivariate Poisson for remaining goals (up to 6 additional goals each)
+    const maxG = 6;
+    for (let h = 0; h <= maxG; h++) {
+      const pH = this.poissonPmf(remainingLambdaHome, h);
+      for (let a = 0; a <= maxG; a++) {
+        const pA = this.poissonPmf(remainingLambdaAway, a);
+        const jointP = pH * pA;
+        const finalHome = homeScore + h;
+        const finalAway = awayScore + a;
+
+        if (finalHome > finalAway) pHomeWin += jointP;
+        else if (finalHome === finalAway) pDraw += jointP;
+        else pAwayWin += jointP;
+      }
     }
 
-    const sum = pHome + pDraw + pAway;
+    const total = pHomeWin + pDraw + pAwayWin || 1;
     return {
-      homeWin: Number((pHome / sum).toFixed(4)),
-      draw: Number((pDraw / sum).toFixed(4)),
-      awayWin: Number((pAway / sum).toFixed(4)),
+      homeWin: Number((pHomeWin / total).toFixed(4)),
+      draw: Number((pDraw / total).toFixed(4)),
+      awayWin: Number((pAwayWin / total).toFixed(4)),
     };
   }
 
-  /**
-   * Trigger an on-demand event (e.g. goal or reset) for testing
-   */
-  public static async triggerSimulatedEvent(matchId: number, eventType: 'GOAL_HOME' | 'GOAL_AWAY' | 'ADVANCE_5'): Promise<any> {
-    const [m] = await db.select().from(matches).where(eq(matches.id, matchId)).limit(1);
-    if (!m) throw new Error('Match not found');
+  private static poissonPmf(lambda: number, k: number): number {
+    if (lambda <= 0) return k === 0 ? 1 : 0;
+    return (Math.exp(-lambda) * Math.pow(lambda, k)) / this.factorial(k);
+  }
 
-    const meta = (m.metadata as LiveMatchMetadata) || {
-      minute: 20,
-      period: '1H',
-      lastUpdated: new Date().toISOString(),
-      events: [],
-      liveStats: {
-        possession: { home: 50, away: 50 },
-        shots: { home: 4, away: 4 },
-        shotsOnTarget: { home: 2, away: 2 },
-        corners: { home: 2, away: 2 },
-        fouls: { home: 4, away: 4 },
-        yellowCards: { home: 0, away: 0 },
-        redCards: { home: 0, away: 0 },
-        liveXg: { home: 0.5, away: 0.5 },
-        pitchTilt: { home: 50, away: 50 },
-      },
-      inPlayProbabilities: { homeWin: 0.45, draw: 0.3, awayWin: 0.25 },
-    };
-
-    let homeScore = m.homeScoreFullTime ?? 0;
-    let awayScore = m.awayScoreFullTime ?? 0;
-    let minute = meta.minute;
-    const events = [...(meta.events || [])];
-
-    if (eventType === 'GOAL_HOME') {
-      homeScore += 1;
-      const ev: LiveEventItem = {
-        id: `ev_test_${Date.now()}`,
-        minute,
-        type: 'GOAL',
-        team: 'HOME',
-        player: 'Simulated Goalscorer',
-        scoreAfter: `${homeScore}-${awayScore}`,
-        description: 'GOAL! Powerful strike into the roof of the net!',
-      };
-      events.push(ev);
-      meta.lastEvent = ev;
-      meta.liveStats.liveXg.home = Number((meta.liveStats.liveXg.home + 0.48).toFixed(2));
-      meta.liveStats.shotsOnTarget.home += 1;
-    } else if (eventType === 'GOAL_AWAY') {
-      awayScore += 1;
-      const ev: LiveEventItem = {
-        id: `ev_test_${Date.now()}`,
-        minute,
-        type: 'GOAL',
-        team: 'AWAY',
-        player: 'Simulated Goalscorer',
-        scoreAfter: `${homeScore}-${awayScore}`,
-        description: 'GOAL! Away team strikes on the counter-attack!',
-      };
-      events.push(ev);
-      meta.lastEvent = ev;
-      meta.liveStats.liveXg.away = Number((meta.liveStats.liveXg.away + 0.44).toFixed(2));
-      meta.liveStats.shotsOnTarget.away += 1;
-    } else if (eventType === 'ADVANCE_5') {
-      minute = Math.min(90, minute + 5);
-    }
-
-    const inPlay = LiveMatchEngine.calculateInPlayProbabilities(homeScore, awayScore, minute);
-
-    const updatedMeta: LiveMatchMetadata = {
-      ...meta,
-      minute,
-      events,
-      lastUpdated: new Date().toISOString(),
-      inPlayProbabilities: inPlay,
-    };
-
-    await db
-      .update(matches)
-      .set({
-        homeScoreFullTime: homeScore,
-        awayScoreFullTime: awayScore,
-        metadata: updatedMeta,
-      })
-      .where(eq(matches.id, matchId));
-
-    return {
-      matchId,
-      homeScore,
-      awayScore,
-      minute,
-      updatedMeta,
-    };
+  private static factorial(n: number): number {
+    let f = 1;
+    for (let i = 2; i <= n; i++) f *= i;
+    return f;
   }
 }

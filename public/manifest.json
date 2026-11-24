@@ -1,0 +1,18 @@
+{
+  "name": "PitchIntel — Worldwide Football Intelligence",
+  "short_name": "PitchIntel",
+  "description": "Evidence-based worldwide football intelligence, dynamic ratings, statistical modeling, simulation, and backtesting engine.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#060913",
+  "theme_color": "#060913",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "192x192 512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

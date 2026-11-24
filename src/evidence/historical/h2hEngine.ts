@@ -1,6 +1,6 @@
-import { and, desc, eq, or, sql } from 'drizzle-orm';
+import { and, desc, eq, lt, lte, or } from 'drizzle-orm';
 import { db } from '../../db/index.ts';
-import { matches, matchStatistics } from '../../db/schema.ts';
+import { matches, teamRatings } from '../../db/schema.ts';
 
 export interface H2HSummary {
   directH2HFound: boolean;
@@ -27,27 +27,42 @@ export interface TeamFormMetric {
   goalsScoredAvg: number;
   goalsConcededAvg: number;
   cleanSheetRate: number;
-  exponentialFormIndex: number; // Decayed score where recent matches have 3x weight of older matches
+  exponentialFormIndex: number; // Decayed score where recent matches have higher weight than older matches
   venueSpecificWinRate: number;
+}
+
+export interface EffectiveTeamRating {
+  teamId: number;
+  overallElo: number;
+  attackRating: number;
+  defenseRating: number;
+  homeAdvantage: number;
+  matchesPlayed: number;
+  isFromComputedHistory: boolean;
+  isBaselineDefault: boolean;
 }
 
 export class HistoricalEvidenceEngine {
   /**
-   * Extract Direct Head-to-Head record between two teams
+   * Extract Direct Head-to-Head record between two teams with date-aware cutoff
    */
-  public static async getH2HRecord(teamAId: number, teamBId: number): Promise<H2HSummary> {
+  public static async getH2HRecord(teamAId: number, teamBId: number, asOfDate?: Date): Promise<H2HSummary> {
+    const conditions = [
+      eq(matches.status, 'FINISHED'),
+      or(
+        and(eq(matches.homeTeamId, teamAId), eq(matches.awayTeamId, teamBId)),
+        and(eq(matches.homeTeamId, teamBId), eq(matches.awayTeamId, teamAId))
+      ),
+    ];
+
+    if (asOfDate) {
+      conditions.push(lt(matches.kickoffTime, asOfDate));
+    }
+
     const directMatches = await db
       .select()
       .from(matches)
-      .where(
-        and(
-          eq(matches.status, 'FINISHED'),
-          or(
-            and(eq(matches.homeTeamId, teamAId), eq(matches.awayTeamId, teamBId)),
-            and(eq(matches.homeTeamId, teamBId), eq(matches.awayTeamId, teamAId))
-          )
-        )
-      )
+      .where(and(...conditions))
       .orderBy(desc(matches.kickoffTime))
       .limit(10);
 
@@ -108,18 +123,22 @@ export class HistoricalEvidenceEngine {
   }
 
   /**
-   * Calculate detailed exponential-decay form for a team (last 10 matches)
+   * Calculate detailed exponential-decay form for a team (last 10 matches) with date-aware cutoff
    */
-  public static async getTeamForm(teamId: number, isHomeVenue: boolean): Promise<TeamFormMetric> {
+  public static async getTeamForm(teamId: number, isHomeVenue: boolean, asOfDate?: Date): Promise<TeamFormMetric> {
+    const conditions = [
+      eq(matches.status, 'FINISHED'),
+      or(eq(matches.homeTeamId, teamId), eq(matches.awayTeamId, teamId)),
+    ];
+
+    if (asOfDate) {
+      conditions.push(lt(matches.kickoffTime, asOfDate));
+    }
+
     const recent = await db
       .select()
       .from(matches)
-      .where(
-        and(
-          eq(matches.status, 'FINISHED'),
-          or(eq(matches.homeTeamId, teamId), eq(matches.awayTeamId, teamId))
-        )
-      )
+      .where(and(...conditions))
       .orderBy(desc(matches.kickoffTime))
       .limit(10);
 
@@ -128,12 +147,12 @@ export class HistoricalEvidenceEngine {
         teamId,
         sampleMatches: 0,
         formString: '-----',
-        pointsPerGame: 1.35,
-        goalsScoredAvg: 1.3,
-        goalsConcededAvg: 1.3,
-        cleanSheetRate: 0.25,
-        exponentialFormIndex: 50.0,
-        venueSpecificWinRate: isHomeVenue ? 0.45 : 0.32,
+        pointsPerGame: 0,
+        goalsScoredAvg: 0,
+        goalsConcededAvg: 0,
+        cleanSheetRate: 0,
+        exponentialFormIndex: 0,
+        venueSpecificWinRate: 0,
       };
     }
 
@@ -141,7 +160,7 @@ export class HistoricalEvidenceEngine {
     let scored = 0;
     let conceded = 0;
     let cleanSheets = 0;
-    let formChars: string[] = [];
+    const formChars: string[] = [];
     let decayedScore = 0;
     let totalWeight = 0;
 
@@ -170,7 +189,7 @@ export class HistoricalEvidenceEngine {
       points += matchPts;
       formChars.push(char);
 
-      // Exponential decay: most recent has weight 1.0, 10th has weight 0.25
+      // Exponential decay: most recent has weight 1.0, 10th has weight ~0.26
       const decayWeight = Math.exp(-0.15 * idx);
       decayedScore += (matchPts / 3) * 100 * decayWeight;
       totalWeight += decayWeight;
@@ -191,7 +210,135 @@ export class HistoricalEvidenceEngine {
       goalsConcededAvg: Number((conceded / N).toFixed(2)),
       cleanSheetRate: Number((cleanSheets / N).toFixed(2)),
       exponentialFormIndex: Number((decayedScore / totalWeight).toFixed(1)),
-      venueSpecificWinRate: venueMatches > 0 ? Number((venueWins / venueMatches).toFixed(2)) : (isHomeVenue ? 0.48 : 0.30),
+      venueSpecificWinRate: venueMatches > 0 ? Number((venueWins / venueMatches).toFixed(2)) : 0,
+    };
+  }
+
+  /**
+   * Resolve a team's pre-match rating from stored team_ratings (if non-default) or
+   * compute directly from genuine finished matches strictly prior to asOfDate.
+   */
+  public static async getEffectiveTeamRating(teamId: number, asOfDate?: Date): Promise<EffectiveTeamRating> {
+    if (!teamId || teamId <= 0) {
+      return {
+        teamId: teamId || 0,
+        overallElo: 1500,
+        attackRating: 100,
+        defenseRating: 100,
+        homeAdvantage: 65,
+        matchesPlayed: 0,
+        isFromComputedHistory: false,
+        isBaselineDefault: true,
+      };
+    }
+
+    const ratingConditions = [eq(teamRatings.teamId, teamId)];
+    if (asOfDate) {
+      ratingConditions.push(lte(teamRatings.ratingTimestamp, asOfDate));
+    }
+
+    const [storedRating] = await db
+      .select()
+      .from(teamRatings)
+      .where(and(...ratingConditions))
+      .orderBy(desc(teamRatings.ratingTimestamp))
+      .limit(1);
+
+    const hasNonDefaultStored =
+      storedRating &&
+      (Math.abs(storedRating.overallElo - 1500) > 0.05 ||
+        Math.abs(storedRating.attackRating - 100) > 0.05 ||
+        Math.abs(storedRating.defenseRating - 100) > 0.05);
+
+    const historyConditions = [
+      eq(matches.status, 'FINISHED'),
+      or(eq(matches.homeTeamId, teamId), eq(matches.awayTeamId, teamId)),
+    ];
+    if (asOfDate) {
+      historyConditions.push(lt(matches.kickoffTime, asOfDate));
+    }
+
+    const history = await db
+      .select({
+        kickoffTime: matches.kickoffTime,
+        homeTeamId: matches.homeTeamId,
+        awayTeamId: matches.awayTeamId,
+        homeScore: matches.homeScoreFullTime,
+        awayScore: matches.awayScoreFullTime,
+      })
+      .from(matches)
+      .where(and(...historyConditions))
+      .orderBy(desc(matches.kickoffTime))
+      .limit(30);
+
+    if (hasNonDefaultStored) {
+      return {
+        teamId,
+        overallElo: Number(storedRating.overallElo.toFixed(1)),
+        attackRating: Number(storedRating.attackRating.toFixed(1)),
+        defenseRating: Number(storedRating.defenseRating.toFixed(1)),
+        homeAdvantage: storedRating.homeAdvantage,
+        matchesPlayed: history.length,
+        isFromComputedHistory: false,
+        isBaselineDefault: false,
+      };
+    }
+
+    if (history.length === 0) {
+      return {
+        teamId,
+        overallElo: 1500,
+        attackRating: 100,
+        defenseRating: 100,
+        homeAdvantage: 65,
+        matchesPlayed: 0,
+        isFromComputedHistory: false,
+        isBaselineDefault: true,
+      };
+    }
+
+    // Compute empirical rating chronologically across up to 30 most recent prior matches
+    const chronological = [...history].reverse();
+    let elo = 1500;
+    let totalScored = 0;
+    let totalConceded = 0;
+
+    for (const m of chronological) {
+      const isHome = m.homeTeamId === teamId;
+      const scored = isHome ? (m.homeScore ?? 0) : (m.awayScore ?? 0);
+      const conceded = isHome ? (m.awayScore ?? 0) : (m.homeScore ?? 0);
+
+      totalScored += scored;
+      totalConceded += conceded;
+
+      const actual = scored > conceded ? 1 : scored === conceded ? 0.5 : 0;
+      const expected = 1 / (1 + Math.pow(10, (1500 - (elo + (isHome ? 65 : 0))) / 400));
+      const gd = Math.abs(scored - conceded);
+      const goalMult = gd >= 3 ? 1.5 : gd === 2 ? 1.25 : 1.0;
+      elo += 24 * goalMult * (actual - expected);
+    }
+
+    const n = chronological.length;
+    const avgScored = totalScored / n;
+    const avgConceded = totalConceded / n;
+
+    // Shrink toward league neutral (1.30 goals/match) for small samples
+    const shrinkageWeight = 6;
+    const smoothedScored = (n * avgScored + shrinkageWeight * 1.3) / (n + shrinkageWeight);
+    const smoothedConceded = (n * avgConceded + shrinkageWeight * 1.3) / (n + shrinkageWeight);
+
+    const attackRating = Math.max(65, Math.min(140, (smoothedScored / 1.3) * 100));
+    const defenseRating = Math.max(65, Math.min(140, 100 + ((1.3 - smoothedConceded) / 1.3) * 35));
+
+    return {
+      teamId,
+      overallElo: Number(elo.toFixed(1)),
+      attackRating: Number(attackRating.toFixed(1)),
+      defenseRating: Number(defenseRating.toFixed(1)),
+      homeAdvantage: 65,
+      matchesPlayed: n,
+      isFromComputedHistory: true,
+      isBaselineDefault: false,
     };
   }
 }

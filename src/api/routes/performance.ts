@@ -1,54 +1,110 @@
 import { Router, Request, Response } from 'express';
-import { desc, isNotNull } from 'drizzle-orm';
+import { desc, inArray } from 'drizzle-orm';
 import { db } from '../../db/index.ts';
 import { matches, predictionLedger, teams } from '../../db/schema.ts';
+import { WalkForwardBacktester } from '../../backtesting/walkForwardValidator.ts';
 
 export const performanceRouter = Router();
 
 // GET /api/model-performance
-performanceRouter.get('/', async (_req: Request, res: Response) => {
+// Calculates metrics strictly from evaluated historical outcomes or walk-forward backtests
+performanceRouter.get('/', async (req: Request, res: Response) => {
   try {
     const predictions = await db.select().from(predictionLedger);
     const totalPredictions = predictions.length;
 
     const evaluated = predictions.filter((p) => p.actualResult !== null && p.wasCorrect !== null);
-    const correctCount = evaluated.filter((p) => p.wasCorrect).length;
 
-    let brierSum = 0;
-    let logLossSum = 0;
-    evaluated.forEach((p) => {
-      brierSum += p.brierScore ?? 0.20;
-      logLossSum += p.logLoss ?? 0.58;
-    });
+    if (evaluated.length >= 10) {
+      // Calculate empirical metrics from resolved prediction ledger records
+      const correctCount = evaluated.filter((p) => p.wasCorrect).length;
 
-    const accuracy = evaluated.length > 0 ? Number((correctCount / evaluated.length).toFixed(3)) : 0.692;
-    const brierScore = evaluated.length > 0 ? Number((brierSum / evaluated.length).toFixed(4)) : 0.194;
-    const logLoss = evaluated.length > 0 ? Number((logLossSum / evaluated.length).toFixed(4)) : 0.578;
+      let brierSum = 0;
+      let logLossSum = 0;
+      let homeWins = 0;
+      let homeCorrect = 0;
+      let draws = 0;
+      let drawCorrect = 0;
+      let awayWins = 0;
+      let awayCorrect = 0;
+
+      evaluated.forEach((p) => {
+        brierSum += p.brierScore ?? 0.25;
+        logLossSum += p.logLoss ?? 0.693;
+
+        if (p.actualResult === 'HOME_WIN') {
+          homeWins++;
+          if (p.homeWinProb > p.drawProb && p.homeWinProb > p.awayWinProb) homeCorrect++;
+        } else if (p.actualResult === 'DRAW') {
+          draws++;
+          if (p.drawProb > p.homeWinProb && p.drawProb > p.awayWinProb) drawCorrect++;
+        } else if (p.actualResult === 'AWAY_WIN') {
+          awayWins++;
+          if (p.awayWinProb > p.homeWinProb && p.awayWinProb > p.drawProb) awayCorrect++;
+        }
+      });
+
+      const accuracy = Number((correctCount / evaluated.length).toFixed(3));
+      const brierScore = Number((brierSum / evaluated.length).toFixed(4));
+      const logLoss = Number((logLossSum / evaluated.length).toFixed(4));
+
+      return res.json({
+        status: 'VERIFIED_LEDGER_EVALUATION',
+        modelVersion: 'football-engine-v2.0-full-intelligence',
+        sampleSize: totalPredictions,
+        evaluatedMatches: evaluated.length,
+        evaluatedTimeRange: {
+          earliest: evaluated[0]?.predictionTimestamp || new Date().toISOString(),
+          latest: evaluated[evaluated.length - 1]?.predictionTimestamp || new Date().toISOString(),
+        },
+        metrics: {
+          accuracy,
+          brierScore,
+          logLoss,
+          baselineComparison: {
+            naiveHomeWinBaseline: Number((homeWins / evaluated.length).toFixed(3)),
+            uniformRandomBaseline: 0.333,
+            edgeOverNaive: Number((accuracy - homeWins / evaluated.length).toFixed(3)),
+          },
+        },
+        breakdownByMarket: {
+          homeWinAccuracy: homeWins > 0 ? Number((homeCorrect / homeWins).toFixed(3)) : null,
+          drawAccuracy: draws > 0 ? Number((drawCorrect / draws).toFixed(3)) : null,
+          awayWinAccuracy: awayWins > 0 ? Number((awayCorrect / awayWins).toFixed(3)) : null,
+        },
+      });
+    }
+
+    // When insufficient evaluated ledger rows exist, run real historical walk-forward backtest
+    const backtestLimit = req.query.limit ? parseInt(req.query.limit as string, 10) : 50;
+    const backtest = await WalkForwardBacktester.runBacktest({ limit: backtestLimit });
 
     res.json({
+      status: 'VERIFIED_WALK_FORWARD_BACKTEST',
       modelVersion: 'football-engine-v2.0-full-intelligence',
-      sampleSize: totalPredictions,
-      evaluatedMatches: evaluated.length,
+      sampleSize: backtest.totalMatchesTested,
+      evaluatedMatches: backtest.totalMatchesTested,
+      evaluatedTimeRange: {
+        earliest: backtest.testedTimeRange.start.toISOString(),
+        latest: backtest.testedTimeRange.end.toISOString(),
+      },
       metrics: {
-        accuracy,
-        brierScore,
-        logLoss,
-        expectedCalibrationError: 0.038,
+        accuracy: backtest.overallAccuracy,
+        brierScore: backtest.avgBrierScore,
+        logLoss: backtest.avgLogLoss,
+        baselineComparison: {
+          naiveHomeWinBaseline: backtest.naiveHomeWinBaseline,
+          uniformRandomBaseline: 0.333,
+          edgeOverNaive: Number((backtest.overallAccuracy - backtest.naiveHomeWinBaseline).toFixed(3)),
+        },
       },
-      modelComparison: [
-        { model: 'Ensemble (Production Active)', accuracy: 0.692, brierScore: 0.194, status: 'ACTIVE' },
-        { model: 'Dixon-Coles Model (Tau correlation)', accuracy: 0.655, brierScore: 0.208, status: 'BENCHMARK' },
-        { model: 'Monte Carlo 5k Simulation', accuracy: 0.648, brierScore: 0.212, status: 'BENCHMARK' },
-        { model: 'Dynamic Elo Model', accuracy: 0.631, brierScore: 0.221, status: 'BENCHMARK' },
-        { model: 'Bivariate Poisson Model', accuracy: 0.618, brierScore: 0.229, status: 'BENCHMARK' },
-      ],
+      modelComparison: backtest.modelComparison,
       breakdownByMarket: {
-        homeWinAccuracy: 0.73,
-        drawAccuracy: 0.39,
-        awayWinAccuracy: 0.65,
-        over25Accuracy: 0.71,
-        bttsAccuracy: 0.67,
+        homeWinAccuracy: backtest.homeWinAccuracy,
+        drawAccuracy: backtest.drawAccuracy,
+        awayWinAccuracy: backtest.awayWinAccuracy,
       },
+      futureDataLeakagePrevention: 'STRICT_PRE_KICKOFF_ONLY',
     });
   } catch (error: any) {
     console.error('Failed to get model performance:', error);
@@ -84,10 +140,19 @@ predictionHistoryRouter.get('/', async (_req: Request, res: Response) => {
       .orderBy(desc(predictionLedger.predictionTimestamp))
       .limit(50);
 
-    const allMatches = await db.select().from(matches);
-    const allTeams = await db.select().from(teams);
-    const matchMap = new Map(allMatches.map((m) => [m.id, m]));
-    const teamMap = new Map(allTeams.map((t) => [t.id, t.canonicalName]));
+    const matchIds = Array.from(new Set(items.map((p) => p.matchId)));
+    const relevantMatches = matchIds.length > 0
+      ? await db.select().from(matches).where(inArray(matches.id, matchIds))
+      : [];
+    const matchMap = new Map(relevantMatches.map((m) => [m.id, m]));
+
+    const teamIds = Array.from(
+      new Set(relevantMatches.flatMap((m) => [m.homeTeamId, m.awayTeamId]))
+    );
+    const relevantTeams = teamIds.length > 0
+      ? await db.select().from(teams).where(inArray(teams.id, teamIds))
+      : [];
+    const teamMap = new Map(relevantTeams.map((t) => [t.id, t.canonicalName]));
 
     const enriched = items.map((p) => {
       const match = matchMap.get(p.matchId);

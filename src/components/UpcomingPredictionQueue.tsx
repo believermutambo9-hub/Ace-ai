@@ -21,11 +21,11 @@ import {
   Play,
   Check,
 } from 'lucide-react';
-import { UpcomingMatchItem, UpcomingDashboardResponse, PredictionQueueStatus } from '../data/upcoming/upcomingEngine.ts';
+import type { UpcomingMatchItem, UpcomingDashboardResponse, PredictionQueueStatus, MatchProbabilityTrend } from '../types/football.ts';
 import { EnsembleProbabilityTrendChart } from './EnsembleProbabilityTrendChart.tsx';
-import { MatchProbabilityTrend } from '../data/upcoming/trendEngine.ts';
 import { MatchTacticalDossierModal } from './MatchTacticalDossierModal.tsx';
 import { PortfolioStore } from '../data/portfolio/portfolioStore.ts';
+import { ErrorReportingService } from '../services/errorReporting.ts';
 
 interface UpcomingPredictionQueueProps {
   onInspectMatch: (match: any) => void;
@@ -56,14 +56,26 @@ export function UpcomingPredictionQueue({ onInspectMatch }: UpcomingPredictionQu
   const [onDemandSearch, setOnDemandSearch] = useState<string>('');
   const [selectedFixtureForPredict, setSelectedFixtureForPredict] = useState<number | null>(null);
 
+  const [fetchError, setFetchError] = useState<string | null>(null);
+
   const fetchUpcomingData = async (hours?: number) => {
     try {
+      setFetchError(null);
       const url = hours ? `/api/upcoming?hours=${hours}` : '/api/upcoming';
-      const res = await fetch(url);
-      const data: UpcomingDashboardResponse = await res.json();
-      setDashboardData(data);
-    } catch (err) {
+      const res = await ErrorReportingService.apiFetch(url, undefined, {
+        source: 'UpcomingPredictionQueue.fetchUpcomingData',
+      });
+      const data = await res.json();
+      if (res.ok && data && Array.isArray(data.matches)) {
+        setDashboardData(data);
+      } else {
+        if (data?.error) {
+          console.warn('Upcoming dashboard warning:', data.error);
+        }
+      }
+    } catch (err: any) {
       console.error('Failed to load upcoming matches data:', err);
+      setFetchError(err?.message || 'Network error fetching upcoming matches');
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -107,11 +119,15 @@ export function UpcomingPredictionQueue({ onInspectMatch }: UpcomingPredictionQu
     try {
       setProcessingMatchId(matchId);
       setActionNotice('Running prediction engine (Dixon-Coles + Poisson + Dynamic Elo + Monte Carlo)...');
-      const res = await fetch('/api/upcoming/predict-fixture', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fixtureId: matchId }),
-      });
+      const res = await ErrorReportingService.apiFetch(
+        '/api/upcoming/predict-fixture',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fixtureId: matchId }),
+        },
+        { source: 'UpcomingPredictionQueue.handleGeneratePrediction' }
+      );
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Prediction failed');
 
@@ -131,9 +147,11 @@ export function UpcomingPredictionQueue({ onInspectMatch }: UpcomingPredictionQu
     try {
       setProcessingMatchId(matchId);
       setActionNotice('Generating refreshed prediction version with latest pre-match evidence...');
-      const res = await fetch(`/api/upcoming/predictions/${matchId}/refresh`, {
-        method: 'POST',
-      });
+      const res = await ErrorReportingService.apiFetch(
+        `/api/upcoming/predictions/${matchId}/refresh`,
+        { method: 'POST' },
+        { source: 'UpcomingPredictionQueue.handleRefreshPrediction' }
+      );
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Refresh failed');
 
@@ -155,8 +173,15 @@ export function UpcomingPredictionQueue({ onInspectMatch }: UpcomingPredictionQu
       setModalTrendData(null);
       setLoadingVersions(true);
       const [versionsRes, trendRes] = await Promise.all([
-        fetch(`/api/upcoming/predictions/${match.id}`).then((r) => r.json()),
-        fetch(`/api/upcoming/predictions/${match.id}/trend`).then((r) => r.json()).catch(() => null),
+        ErrorReportingService.fetchJson<any>(`/api/upcoming/predictions/${match.id}`, undefined, {
+          source: 'UpcomingPredictionQueue.handleViewVersions',
+          fallbackValue: { versions: [] },
+        }),
+        ErrorReportingService.fetchJson<any>(`/api/upcoming/predictions/${match.id}/trend`, undefined, {
+          source: 'UpcomingPredictionQueue.handleViewVersions',
+          expectedStatuses: [404],
+          fallbackValue: null,
+        }),
       ]);
       setMatchVersionsList(versionsRes.versions || []);
       if (trendRes && !trendRes.error) {
@@ -201,7 +226,7 @@ export function UpcomingPredictionQueue({ onInspectMatch }: UpcomingPredictionQu
 
   // Filtered upcoming matches
   const filteredMatches = useMemo(() => {
-    if (!dashboardData) return [];
+    if (!dashboardData || !Array.isArray(dashboardData.matches)) return [];
     let list = dashboardData.matches;
 
     // Time window filter
@@ -243,7 +268,7 @@ export function UpcomingPredictionQueue({ onInspectMatch }: UpcomingPredictionQu
 
   // Matches available for on-demand search selector
   const availableUpcomingForSearch = useMemo(() => {
-    if (!dashboardData) return [];
+    if (!dashboardData || !Array.isArray(dashboardData.matches)) return [];
     if (!onDemandSearch.trim()) return dashboardData.matches;
     const q = onDemandSearch.toLowerCase();
     return dashboardData.matches.filter(
@@ -256,9 +281,13 @@ export function UpcomingPredictionQueue({ onInspectMatch }: UpcomingPredictionQu
   }, [dashboardData, onDemandSearch]);
 
   const compsList = useMemo(() => {
-    if (!dashboardData) return [];
+    if (!dashboardData || !Array.isArray(dashboardData.matches)) return [];
     const set = new Set<string>();
-    dashboardData.matches.forEach((m) => set.add(m.competitionCode));
+    dashboardData.matches.forEach((m) => {
+      if (m?.competitionCode) {
+        set.add(m.competitionCode);
+      }
+    });
     return Array.from(set);
   }, [dashboardData]);
 
@@ -273,7 +302,7 @@ export function UpcomingPredictionQueue({ onInspectMatch }: UpcomingPredictionQu
               Upcoming Discovery &amp; Prediction Queue
             </h2>
             <span className="text-xs font-mono text-emerald-400">
-              football-data.org v4 feed
+              PostgreSQL + Multi-Provider Queue
             </span>
           </div>
           <p className="text-xs text-slate-400 mt-1">
@@ -319,242 +348,92 @@ export function UpcomingPredictionQueue({ onInspectMatch }: UpcomingPredictionQu
         </div>
       )}
 
-      {/* SECTION: PREDICTION QUEUE METRICS STRIP */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <div
-          onClick={() => setQueueStatusFilter('ALL')}
-          className={`p-4 rounded-xl border cursor-pointer transition-colors ${
-            queueStatusFilter === 'ALL'
-              ? 'bg-slate-900 border-emerald-500/80 shadow-md'
-              : 'bg-slate-900/60 border-slate-800 hover:border-slate-700'
-          }`}
-        >
-          <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
-            <span className="font-medium">Total in Queue</span>
-            <Layers className="w-3.5 h-3.5 text-slate-500" />
-          </div>
-          <div className="text-2xl font-bold text-white font-mono tabular-nums">
-            {dashboardData?.queueSummary.total ?? 0}
-          </div>
-          <span className="text-[11px] text-slate-500">Upcoming Fixtures</span>
-        </div>
-
-        <div
-          onClick={() => setQueueStatusFilter('READY')}
-          className={`p-4 rounded-xl border cursor-pointer transition-colors ${
-            queueStatusFilter === 'READY'
-              ? 'bg-emerald-950/40 border-emerald-500/90 shadow-md'
-              : 'bg-slate-900/60 border-slate-800 hover:border-slate-700'
-          }`}
-        >
-          <div className="flex items-center justify-between text-xs text-emerald-400 mb-1">
-            <span className="font-medium">Ready</span>
-            <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
-          </div>
-          <div className="text-2xl font-bold text-emerald-400 font-mono tabular-nums">
-            {dashboardData?.queueSummary.ready ?? 0}
-          </div>
-          <span className="text-[11px] text-slate-500">Prediction Calibrated</span>
-        </div>
-
-        <div
-          onClick={() => setQueueStatusFilter('PENDING')}
-          className={`p-4 rounded-xl border cursor-pointer transition-colors ${
-            queueStatusFilter === 'PENDING'
-              ? 'bg-amber-950/40 border-amber-500/90 shadow-md'
-              : 'bg-slate-900/60 border-slate-800 hover:border-slate-700'
-          }`}
-        >
-          <div className="flex items-center justify-between text-xs text-amber-400 mb-1">
-            <span className="font-medium">Pending</span>
-            <Clock className="w-3.5 h-3.5 text-amber-400" />
-          </div>
-          <div className="text-2xl font-bold text-amber-400 font-mono tabular-nums">
-            {dashboardData?.queueSummary.pending ?? 0}
-          </div>
-          <span className="text-[11px] text-slate-500">In 5-Hour Active Horizon</span>
-        </div>
-
-        <div
-          onClick={() => setQueueStatusFilter('NOT_YET_GENERATED')}
-          className={`p-4 rounded-2xl border cursor-pointer transition-all ${
-            queueStatusFilter === 'NOT_YET_GENERATED'
-              ? 'bg-slate-800 border-slate-600 shadow-lg'
-              : 'bg-slate-900/60 border-slate-800 hover:border-slate-700'
-          }`}
-        >
-          <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
-            <span className="font-semibold flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-slate-500" />
-              Not Yet Generated
-            </span>
-            <Lock className="w-3.5 h-3.5 text-slate-500" />
-          </div>
-          <div className="text-2xl font-black text-slate-300 font-mono">
-            {dashboardData?.queueSummary.notYetGenerated ?? 0}
-          </div>
-          <span className="text-[11px] text-slate-500">Later Kickoffs / Tomorrow</span>
-        </div>
-      </div>
-
-      {/* SECTION: TIME-WINDOW HORIZON SELECTOR */}
-      <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-3 sm:p-4 space-y-3">
-        <div className="flex items-center justify-between text-xs">
-          <span className="font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
-            <Clock className="w-3.5 h-3.5 text-emerald-400" />
-            DYNAMIC KICKOFF TIME WINDOWS
+      {/* CLEAN TIME-WINDOW HORIZON SELECTOR */}
+      <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-900/80 border border-slate-800 rounded-xl p-2.5 sm:p-3">
+        <div className="flex items-center gap-1.5 overflow-x-auto pb-1 sm:pb-0 scrollbar-none text-xs">
+          <span className="text-slate-500 font-medium mr-1 text-[11px] flex items-center gap-1">
+            <Clock className="w-3.5 h-3.5 text-emerald-400" /> Kickoff:
           </span>
-          <span className="text-slate-500 font-mono text-[11px]">
-            Calculated dynamically from current system time
-          </span>
-        </div>
-
-        <div className="flex items-center gap-1.5 overflow-x-auto pb-1 text-xs">
           <button
             onClick={() => handleSelectWindow('ALL')}
-            className={`px-3 py-1.5 rounded-xl font-medium transition-all whitespace-nowrap ${
+            className={`px-3 py-1.5 rounded-lg font-medium transition-all whitespace-nowrap cursor-pointer ${
               activeWindow === 'ALL'
-                ? 'bg-emerald-600 text-white shadow-md'
-                : 'bg-slate-950 text-slate-400 hover:text-white border border-slate-800'
+                ? 'bg-emerald-600 text-white shadow-sm'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
             }`}
           >
             All Upcoming ({dashboardData?.windowsSummary.totalUpcoming ?? 0})
           </button>
           <button
             onClick={() => handleSelectWindow('TODAY')}
-            className={`px-3 py-1.5 rounded-xl font-medium transition-all whitespace-nowrap ${
+            className={`px-3 py-1.5 rounded-lg font-medium transition-all whitespace-nowrap cursor-pointer ${
               activeWindow === 'TODAY'
-                ? 'bg-emerald-600 text-white shadow-md'
-                : 'bg-slate-950 text-slate-400 hover:text-white border border-slate-800'
+                ? 'bg-emerald-600 text-white shadow-sm'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
             }`}
           >
             Today ({dashboardData?.windowsSummary.today ?? 0})
           </button>
           <button
             onClick={() => handleSelectWindow('1H')}
-            className={`px-3 py-1.5 rounded-xl font-medium transition-all whitespace-nowrap ${
+            className={`px-3 py-1.5 rounded-lg font-medium transition-all whitespace-nowrap cursor-pointer ${
               activeWindow === '1H'
-                ? 'bg-emerald-600 text-white shadow-md'
-                : 'bg-slate-950 text-slate-400 hover:text-white border border-slate-800'
+                ? 'bg-emerald-600 text-white shadow-sm'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
             }`}
           >
-            Next 1 Hour ({dashboardData?.windowsSummary.next1Hour ?? 0})
+            Next 1h ({dashboardData?.windowsSummary.next1Hour ?? 0})
           </button>
           <button
             onClick={() => handleSelectWindow('2H')}
-            className={`px-3 py-1.5 rounded-xl font-medium transition-all whitespace-nowrap ${
+            className={`px-3 py-1.5 rounded-lg font-medium transition-all whitespace-nowrap cursor-pointer ${
               activeWindow === '2H'
-                ? 'bg-emerald-600 text-white shadow-md'
-                : 'bg-slate-950 text-slate-400 hover:text-white border border-slate-800'
+                ? 'bg-emerald-600 text-white shadow-sm'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
             }`}
           >
-            Next 2 Hours ({dashboardData?.windowsSummary.next2Hours ?? 0})
+            Next 2h ({dashboardData?.windowsSummary.next2Hours ?? 0})
           </button>
           <button
             onClick={() => handleSelectWindow('3H')}
-            className={`px-3 py-1.5 rounded-xl font-medium transition-all whitespace-nowrap ${
+            className={`px-3 py-1.5 rounded-lg font-medium transition-all whitespace-nowrap cursor-pointer ${
               activeWindow === '3H'
-                ? 'bg-emerald-600 text-white shadow-md'
-                : 'bg-slate-950 text-slate-400 hover:text-white border border-slate-800'
+                ? 'bg-emerald-600 text-white shadow-sm'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
             }`}
           >
-            Next 3 Hours ({dashboardData?.windowsSummary.next3Hours ?? 0})
-          </button>
-          <button
-            onClick={() => handleSelectWindow('4H')}
-            className={`px-3 py-1.5 rounded-xl font-medium transition-all whitespace-nowrap ${
-              activeWindow === '4H'
-                ? 'bg-emerald-600 text-white shadow-md'
-                : 'bg-slate-950 text-slate-400 hover:text-white border border-slate-800'
-            }`}
-          >
-            Next 4 Hours ({dashboardData?.windowsSummary.next4Hours ?? 0})
+            Next 3h ({dashboardData?.windowsSummary.next3Hours ?? 0})
           </button>
           <button
             onClick={() => handleSelectWindow('5H')}
-            className={`px-3 py-1.5 rounded-xl font-medium transition-all whitespace-nowrap ${
+            className={`px-3 py-1.5 rounded-lg font-medium transition-all whitespace-nowrap cursor-pointer ${
               activeWindow === '5H'
-                ? 'bg-emerald-600 text-white shadow-md'
-                : 'bg-slate-950 text-slate-400 hover:text-white border border-slate-800'
+                ? 'bg-emerald-600 text-white shadow-sm'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
             }`}
           >
-            Next 5 Hours ({dashboardData?.windowsSummary.next5Hours ?? 0})
+            Next 5h ({dashboardData?.windowsSummary.next5Hours ?? 0})
           </button>
           <button
             onClick={() => handleSelectWindow('TOMORROW')}
-            className={`px-3 py-1.5 rounded-xl font-medium transition-all whitespace-nowrap ${
+            className={`px-3 py-1.5 rounded-lg font-medium transition-all whitespace-nowrap cursor-pointer ${
               activeWindow === 'TOMORROW'
-                ? 'bg-emerald-600 text-white shadow-md'
-                : 'bg-slate-950 text-slate-400 hover:text-white border border-slate-800'
+                ? 'bg-emerald-600 text-white shadow-sm'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
             }`}
           >
             Tomorrow ({dashboardData?.windowsSummary.tomorrow ?? 0})
           </button>
         </div>
-      </div>
 
-      {/* SECTION: ON-DEMAND REQUEST PREDICTION TOOL */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-lg space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-800 pb-3">
-          <div>
-            <h4 className="text-sm font-bold text-white flex items-center gap-2">
-              <Sliders className="w-4 h-4 text-emerald-400" />
-              REQUEST ON-DEMAND PREDICTION
-            </h4>
-            <p className="text-xs text-slate-400">
-              Search real fixtures (e.g. &ldquo;Arsenal vs Chelsea&rdquo;) or select any upcoming match to run instant calibration.
-            </p>
-          </div>
-          <span className="text-[11px] font-mono text-slate-500">API: POST /api/predict</span>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
-          <div className="md:col-span-2 space-y-1">
-            <label className="text-xs font-semibold text-slate-300">Search Fixture or Team Name</label>
-            <div className="relative">
-              <Search className="w-4 h-4 text-slate-500 absolute left-3 top-2.5" />
-              <input
-                type="text"
-                value={onDemandSearch}
-                onChange={(e) => setOnDemandSearch(e.target.value)}
-                placeholder="Search e.g. Arsenal vs Chelsea, Real Madrid, Bayern..."
-                className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-9 pr-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500"
-              />
-            </div>
-          </div>
-
-          <div>
-            <label className="text-xs font-semibold text-slate-300 block mb-1">Select Discovered Fixture</label>
-            <select
-              value={selectedFixtureForPredict ?? ''}
-              onChange={(e) => setSelectedFixtureForPredict(e.target.value ? parseInt(e.target.value, 10) : null)}
-              className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-emerald-500"
-            >
-              <option value="">-- Choose an upcoming fixture --</option>
-              {availableUpcomingForSearch.map((fix) => (
-                <option key={fix.id} value={fix.id}>
-                  {fix.homeTeam} vs {fix.awayTeam} ({fix.competitionCode} · {fix.startsInFormatted})
-                </option>
-              ))}
-            </select>
-          </div>
-        </div>
-
-        {selectedFixtureForPredict && (
-          <div className="pt-2 flex items-center justify-between">
-            <span className="text-xs text-emerald-400 font-medium">
-              Fixture #{selectedFixtureForPredict} selected for automated verification and calibration
-            </span>
-            <button
-              onClick={() => handleGeneratePrediction(selectedFixtureForPredict)}
-              disabled={processingMatchId === selectedFixtureForPredict}
-              className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 shadow-md shadow-emerald-950/40"
-            >
-              <Sparkles className="w-3.5 h-3.5" />
-              {processingMatchId === selectedFixtureForPredict ? 'Calculating Prediction...' : 'PREDICT MATCH NOW'}
-            </button>
-          </div>
-        )}
+        <button
+          onClick={handleManualRefresh}
+          disabled={refreshing}
+          className="text-xs text-slate-400 hover:text-white flex items-center gap-1.5 px-2.5 py-1 rounded-lg hover:bg-slate-800 transition"
+        >
+          <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin text-emerald-400' : ''}`} />
+          Refresh
+        </button>
       </div>
 
       {/* FILTER CONTROLS: SEARCH & COMPETITION */}
@@ -764,7 +643,7 @@ export function UpcomingPredictionQueue({ onInspectMatch }: UpcomingPredictionQu
                             <button
                               onClick={() => setTacticalDossierMatch(match)}
                               className="px-2.5 py-1 text-[11px] bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-emerald-500/30 rounded font-sans font-semibold flex items-center gap-1 transition-all cursor-pointer"
-                              title="Inspect tactical form, 15-minute goal timing & simulate lineup absence impacts"
+                              title="Inspect Poisson tactical projections & simulate lineup absence impacts"
                             >
                               <Sliders className="w-3 h-3" />
                               Tactical &amp; Lineups
@@ -869,8 +748,11 @@ export function UpcomingPredictionQueue({ onInspectMatch }: UpcomingPredictionQu
                 matchId={versionModalMatch.id}
                 trendData={modalTrendData}
                 onRefreshTrend={async () => {
-                  const res = await fetch(`/api/upcoming/predictions/${versionModalMatch.id}/trend`);
-                  const data = await res.json();
+                  const data = await ErrorReportingService.fetchJson<any>(
+                    `/api/upcoming/predictions/${versionModalMatch.id}/trend`,
+                    undefined,
+                    { source: 'UpcomingPredictionQueue.onRefreshTrend', fallbackValue: null }
+                  );
                   if (data && !data.error) setModalTrendData(data);
                 }}
               />

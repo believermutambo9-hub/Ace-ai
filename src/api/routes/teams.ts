@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { desc, eq, or } from 'drizzle-orm';
+import { desc, eq, ilike, or } from 'drizzle-orm';
 import { db } from '../../db/index.ts';
 import { matches, teamAliases, teamRatings, teams } from '../../db/schema.ts';
 
@@ -8,32 +8,36 @@ export const teamsRouter = Router();
 // GET /api/teams
 teamsRouter.get('/', async (req: Request, res: Response) => {
   try {
-    const country = req.query.country as string;
-    let query = db.select().from(teams);
+    const country = (req.query.country as string | undefined)?.trim();
 
-    if (country) {
-      const filtered = await db.select().from(teams).where(eq(teams.country, country));
-      return res.json(filtered);
-    }
+    const matchedTeams = country
+      ? await db.select().from(teams).where(ilike(teams.country, country))
+      : await db.select().from(teams);
 
-    const allTeams = await query;
     const allRatings = await db.select().from(teamRatings);
     const ratingMap = new Map<number, any>();
     for (const r of allRatings) {
-      if (!ratingMap.has(r.teamId) || (r.ratingTimestamp && ratingMap.get(r.teamId)?.ratingTimestamp && r.ratingTimestamp > ratingMap.get(r.teamId).ratingTimestamp)) {
+      if (
+        !ratingMap.has(r.teamId) ||
+        (r.ratingTimestamp &&
+          ratingMap.get(r.teamId)?.ratingTimestamp &&
+          r.ratingTimestamp > ratingMap.get(r.teamId).ratingTimestamp)
+      ) {
         ratingMap.set(r.teamId, r);
       }
     }
 
-    const enrichedTeams = allTeams.map((t) => ({
-      ...t,
-      rating: ratingMap.get(t.id) || {
-        overallElo: 1500,
-        attackRating: 100,
-        defenseRating: 100,
-        homeAdvantage: 65,
-      },
-    })).sort((a, b) => (b.rating?.overallElo || 1500) - (a.rating?.overallElo || 1500));
+    const enrichedTeams = matchedTeams
+      .map((t) => ({
+        ...t,
+        rating: ratingMap.get(t.id) || {
+          overallElo: 1500,
+          attackRating: 100,
+          defenseRating: 100,
+          homeAdvantage: 65,
+        },
+      }))
+      .sort((a, b) => (b.rating?.overallElo || 1500) - (a.rating?.overallElo || 1500));
 
     res.json(enrichedTeams);
   } catch (error: any) {
@@ -42,47 +46,11 @@ teamsRouter.get('/', async (req: Request, res: Response) => {
   }
 });
 
-// GET /api/team/:id
-teamsRouter.get('/:id', async (req: Request, res: Response) => {
+// Shared handler for team recent form (supports both /api/teams/form/:teamId and /api/teams/:id/form)
+const handleGetTeamForm = async (req: Request, res: Response) => {
   try {
-    const teamId = parseInt(req.params.id, 10);
-    if (isNaN(teamId)) {
-      return res.status(400).json({ error: 'Invalid team ID' });
-    }
-
-    const [team] = await db.select().from(teams).where(eq(teams.id, teamId)).limit(1);
-    if (!team) {
-      return res.status(404).json({ error: 'Team not found' });
-    }
-
-    const aliases = await db.select().from(teamAliases).where(eq(teamAliases.teamId, teamId));
-    const [rating] = await db
-      .select()
-      .from(teamRatings)
-      .where(eq(teamRatings.teamId, teamId))
-      .orderBy(desc(teamRatings.ratingTimestamp))
-      .limit(1);
-
-    res.json({
-      ...team,
-      aliases: aliases.map((a) => a.aliasName),
-      rating: rating || {
-        overallElo: 1500,
-        attackRating: 100,
-        defenseRating: 100,
-        homeAdvantage: 65,
-      },
-    });
-  } catch (error: any) {
-    console.error('Failed to get team by ID:', error);
-    res.status(500).json({ error: error.message || 'Failed to get team' });
-  }
-});
-
-// GET /api/form/:teamId
-teamsRouter.get('/form/:teamId', async (req: Request, res: Response) => {
-  try {
-    const teamId = parseInt(req.params.teamId, 10);
+    const rawId = req.params.teamId ?? req.params.id;
+    const teamId = parseInt(rawId, 10);
     if (isNaN(teamId)) {
       return res.status(400).json({ error: 'Invalid team ID' });
     }
@@ -90,9 +58,7 @@ teamsRouter.get('/form/:teamId', async (req: Request, res: Response) => {
     const recentMatches = await db
       .select()
       .from(matches)
-      .where(
-        or(eq(matches.homeTeamId, teamId), eq(matches.awayTeamId, teamId))
-      )
+      .where(or(eq(matches.homeTeamId, teamId), eq(matches.awayTeamId, teamId)))
       .orderBy(desc(matches.kickoffTime))
       .limit(10);
 
@@ -127,5 +93,46 @@ teamsRouter.get('/form/:teamId', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('Failed to get team form:', error);
     res.status(500).json({ error: error.message || 'Failed to get team form' });
+  }
+};
+
+// Register form routes BEFORE /:id so '/form/:teamId' never collides with '/:id'
+teamsRouter.get('/form/:teamId', handleGetTeamForm);
+teamsRouter.get('/:id/form', handleGetTeamForm);
+
+// GET /api/teams/:id
+teamsRouter.get('/:id', async (req: Request, res: Response) => {
+  try {
+    const teamId = parseInt(req.params.id, 10);
+    if (isNaN(teamId)) {
+      return res.status(400).json({ error: 'Invalid team ID' });
+    }
+
+    const [team] = await db.select().from(teams).where(eq(teams.id, teamId)).limit(1);
+    if (!team) {
+      return res.status(404).json({ error: 'Team not found' });
+    }
+
+    const aliases = await db.select().from(teamAliases).where(eq(teamAliases.teamId, teamId));
+    const [rating] = await db
+      .select()
+      .from(teamRatings)
+      .where(eq(teamRatings.teamId, teamId))
+      .orderBy(desc(teamRatings.ratingTimestamp))
+      .limit(1);
+
+    res.json({
+      ...team,
+      aliases: aliases.map((a) => a.aliasName),
+      rating: rating || {
+        overallElo: 1500,
+        attackRating: 100,
+        defenseRating: 100,
+        homeAdvantage: 65,
+      },
+    });
+  } catch (error: any) {
+    console.error('Failed to get team by ID:', error);
+    res.status(500).json({ error: error.message || 'Failed to get team' });
   }
 });

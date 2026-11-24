@@ -5,8 +5,12 @@ export interface NormalizedCompetition {
   code: string;
   name: string;
   country: string;
+  countryCode?: string;
   tier: number;
   type: 'LEAGUE' | 'CUP' | 'INTERNATIONAL';
+  format?: string;
+  isDomesticCup?: boolean;
+  gender?: string;
   emblem?: string;
 }
 
@@ -33,12 +37,18 @@ export interface NormalizedMatch {
   awayTeamRawName: string;
   venue?: string;
   referee?: string;
+  attendance?: number;
   status: MatchStatus;
   homeScoreHalfTime?: number | null;
   awayScoreHalfTime?: number | null;
   homeScoreFullTime?: number | null;
   awayScoreFullTime?: number | null;
+  homeScoreExtraTime?: number | null;
+  awayScoreExtraTime?: number | null;
+  homeScorePenalties?: number | null;
+  awayScorePenalties?: number | null;
   result?: MatchResult | null;
+  dataCompleteness?: 'BASIC' | 'SCORES' | 'DETAILED_STATS' | 'ODDS' | 'LINEUPS';
   metadata?: Record<string, any>;
   stats?: {
     home: NormalizedTeamStats;

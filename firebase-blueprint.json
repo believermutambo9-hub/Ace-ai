@@ -1,0 +1,253 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile containing identity and timestamps",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Authentication User ID",
+          "maxLength": 128
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "User email address",
+          "maxLength": 256
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Display name of the user",
+          "maxLength": 100
+        },
+        "photoURL": {
+          "type": "string",
+          "description": "Avatar photo URL",
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last update timestamp"
+        }
+      },
+      "required": ["uid", "email", "createdAt", "updatedAt"]
+    },
+    "UserBet": {
+      "title": "UserBet",
+      "description": "Paper trading bet record tracked in user portfolio",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique Bet ID",
+          "maxLength": 64
+        },
+        "userId": {
+          "type": "string",
+          "description": "Owner user UID",
+          "maxLength": 128
+        },
+        "matchId": {
+          "type": "string",
+          "description": "Associated Match ID",
+          "maxLength": 64
+        },
+        "homeTeam": {
+          "type": "string",
+          "description": "Home club name",
+          "maxLength": 128
+        },
+        "awayTeam": {
+          "type": "string",
+          "description": "Away club name",
+          "maxLength": 128
+        },
+        "competition": {
+          "type": "string",
+          "description": "Competition name",
+          "maxLength": 128
+        },
+        "marketType": {
+          "type": "string",
+          "description": "Bet market type",
+          "enum": ["MATCH_WINNER_HOME", "MATCH_WINNER_DRAW", "MATCH_WINNER_AWAY", "OVER_25", "UNDER_25", "BTTS_YES", "BTTS_NO"]
+        },
+        "selection": {
+          "type": "string",
+          "description": "Specific market selection label",
+          "maxLength": 64
+        },
+        "odds": {
+          "type": "number",
+          "description": "Decimal bookmaker odds at placement"
+        },
+        "stake": {
+          "type": "number",
+          "description": "Stake amount in currency units"
+        },
+        "modelProbability": {
+          "type": "number",
+          "description": "Calculated model win probability"
+        },
+        "status": {
+          "type": "string",
+          "description": "Current bet resolution state",
+          "enum": ["OPEN", "WON", "LOST", "VOID", "PUSH"]
+        },
+        "profit": {
+          "type": "number",
+          "description": "Realized net profit or loss"
+        },
+        "placedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when bet was registered"
+        },
+        "settledAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when bet was finalized"
+        }
+      },
+      "required": ["id", "userId", "matchId", "homeTeam", "awayTeam", "competition", "marketType", "selection", "odds", "stake", "status", "placedAt"]
+    },
+    "UserFavourite": {
+      "title": "UserFavourite",
+      "description": "Bookmarked club or competition for quick tracking",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Identifier for the favourite record",
+          "maxLength": 64
+        },
+        "userId": {
+          "type": "string",
+          "description": "Owner user UID",
+          "maxLength": 128
+        },
+        "entityType": {
+          "type": "string",
+          "description": "Type of favorited entity",
+          "enum": ["TEAM", "COMPETITION"]
+        },
+        "entityId": {
+          "type": "string",
+          "description": "Team or competition code or ID",
+          "maxLength": 64
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name of the team or competition",
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when favourited"
+        }
+      },
+      "required": ["id", "userId", "entityType", "entityId", "name", "createdAt"]
+    },
+    "ErrorReport": {
+      "title": "ErrorReport",
+      "description": "Unhandled API and data-layer failure telemetry logged for monitoring",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique error report document ID",
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userId": {
+          "type": "string",
+          "description": "Firebase UID of reporting user",
+          "maxLength": 128
+        },
+        "source": {
+          "type": "string",
+          "description": "Data layer or UI component origin of the error",
+          "maxLength": 128
+        },
+        "endpoint": {
+          "type": "string",
+          "description": "Sanitized API endpoint path or request URL",
+          "maxLength": 512
+        },
+        "method": {
+          "type": "string",
+          "description": "HTTP method or execution channel",
+          "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "UI", "OTHER"]
+        },
+        "statusCode": {
+          "type": "number",
+          "description": "HTTP response code or 0 for network/runtime failures"
+        },
+        "errorMessage": {
+          "type": "string",
+          "description": "Sanitized failure summary",
+          "maxLength": 1000
+        },
+        "stack": {
+          "type": "string",
+          "description": "Truncated sanitized stack trace",
+          "maxLength": 2000
+        },
+        "context": {
+          "type": "string",
+          "description": "Additional diagnostic context",
+          "maxLength": 1000
+        },
+        "environment": {
+          "type": "string",
+          "description": "Runtime environment where error occurred",
+          "enum": ["browser", "server"]
+        },
+        "status": {
+          "type": "string",
+          "description": "Triage status for error monitoring",
+          "enum": ["OPEN", "ACKNOWLEDGED", "RESOLVED"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO timestamp when error occurred",
+          "maxLength": 64
+        },
+        "resolvedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO timestamp when resolved by admin",
+          "maxLength": 64
+        }
+      },
+      "required": ["id", "userId", "source", "endpoint", "method", "statusCode", "errorMessage", "environment", "status", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User document storing identity and account timestamps"
+    },
+    "/users/{userId}/bets/{betId}": {
+      "schema": "UserBet",
+      "description": "Paper trading bet slips and quantitative ledger items"
+    },
+    "/users/{userId}/favourites/{favouriteId}": {
+      "schema": "UserFavourite",
+      "description": "User bookmarked teams and competitions"
+    },
+    "/error_reports/{reportId}": {
+      "schema": "ErrorReport",
+      "description": "Unhandled API and data-layer failure telemetry logged for monitoring"
+    }
+  }
+}

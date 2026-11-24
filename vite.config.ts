@@ -11,12 +11,12 @@ export default defineConfig(() => {
       tailwindcss(),
       VitePWA({
         registerType: 'autoUpdate',
-        includeAssets: ['favicon.ico', 'apple-touch-icon.png', 'icon.svg'],
+        includeAssets: ['apple-touch-icon.png', 'icon.svg'],
         manifest: {
           id: '/',
-          name: 'KickProphet Football Intelligence',
-          short_name: 'KickProphet',
-          description: 'Institutional-grade quantitative football prediction & statistical modeling terminal.',
+          name: 'PitchIntel — Worldwide Football Intelligence',
+          short_name: 'PitchIntel',
+          description: 'Evidence-based worldwide football intelligence, dynamic ratings, statistical modeling, simulation, and backtesting engine.',
           theme_color: '#060913',
           background_color: '#060913',
           display: 'standalone',
@@ -44,6 +44,7 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
+          maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
           runtimeCaching: [
             {
@@ -87,10 +88,13 @@ export default defineConfig(() => {
         '@': path.resolve(__dirname, '.'),
       },
     },
+    optimizeDeps: {
+      exclude: ['pg', 'pg-native', 'drizzle-orm', 'firebase-admin'],
+    },
     server: {
-      // HMR is disabled in AI Studio via DISABLE_HMR env var.
-      // Do not modify—file watching is disabled to prevent flickering during agent edits.
-      hmr: process.env.DISABLE_HMR !== 'true',
+      // HMR is disabled in AI Studio iframe environment to prevent WebSocket transport failures.
+      hmr: process.env.ENABLE_HMR === 'true',
+      ws: process.env.ENABLE_HMR === 'true' ? {} : (false as const),
       // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
     },

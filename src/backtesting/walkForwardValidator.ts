@@ -1,6 +1,6 @@
-import { and, asc, eq, isNotNull, isNull, sql } from 'drizzle-orm';
+import { and, asc, eq, isNotNull, isNull } from 'drizzle-orm';
 import { db } from '../db/index.ts';
-import { matches, predictionLedger, teamRatings, teams } from '../db/schema.ts';
+import { matches, predictionLedger, teams } from '../db/schema.ts';
 import { PredictionEngine } from '../models/engine.ts';
 import { ProbabilityCalibrator } from '../calibration/calibrator.ts';
 
@@ -13,6 +13,7 @@ export interface BacktestSummary {
   homeWinAccuracy: number;
   drawAccuracy: number;
   awayWinAccuracy: number;
+  naiveHomeWinBaseline: number;
   modelComparison: Array<{
     name: string;
     accuracy: number;
@@ -24,32 +25,58 @@ export interface BacktestSummary {
   };
 }
 
+interface RollingTeamState {
+  elo: number;
+  played: number;
+  recentGoalsFor: number[];
+  recentGoalsAgainst: number[];
+}
+
+function topPickFromProbs(probs: { homeWin: number; draw: number; awayWin: number }): 'HOME_WIN' | 'DRAW' | 'AWAY_WIN' {
+  if (probs.draw > probs.homeWin && probs.draw > probs.awayWin) return 'DRAW';
+  if (probs.awayWin > probs.homeWin && probs.awayWin > probs.draw) return 'AWAY_WIN';
+  return 'HOME_WIN';
+}
+
 export class WalkForwardBacktester {
   /**
-   * Run chronological walk-forward backtest over completed historical fixtures
+   * Run strict chronological walk-forward backtest over completed historical fixtures.
+   * All team Elo, attack, and defense strengths are maintained strictly online from
+   * prior matches ONLY (never reading future outcomes).
    */
   public static async runBacktest(options?: {
     competitionId?: number;
     limit?: number;
   }): Promise<BacktestSummary> {
-    const limit = options?.limit ?? 150;
+    const limit = Math.max(1, Math.min(500, options?.limit ?? 150));
 
-    let query = db
-      .select()
+    const whereConditions = [
+      eq(matches.status, 'FINISHED'),
+      isNotNull(matches.result),
+      isNotNull(matches.homeScoreFullTime),
+      isNotNull(matches.awayScoreFullTime),
+    ];
+
+    if (options?.competitionId) {
+      whereConditions.push(eq(matches.competitionId, options.competitionId));
+    }
+
+    const allFinished = await db
+      .select({
+        id: matches.id,
+        kickoffTime: matches.kickoffTime,
+        homeTeamId: matches.homeTeamId,
+        awayTeamId: matches.awayTeamId,
+        venue: matches.venue,
+        homeScoreFullTime: matches.homeScoreFullTime,
+        awayScoreFullTime: matches.awayScoreFullTime,
+        result: matches.result,
+      })
       .from(matches)
-      .where(
-        and(
-          eq(matches.status, 'FINISHED'),
-          isNotNull(matches.result),
-          isNotNull(matches.homeScoreFullTime),
-          isNotNull(matches.awayScoreFullTime)
-        )
-      )
-      .orderBy(asc(matches.kickoffTime)) // Chronological order to prevent future data leakage
-      .limit(limit);
+      .where(and(...whereConditions))
+      .orderBy(asc(matches.kickoffTime));
 
-    const testMatches = await query;
-    if (testMatches.length === 0) {
+    if (allFinished.length === 0) {
       return {
         totalMatchesTested: 0,
         correctPredictions: 0,
@@ -59,13 +86,43 @@ export class WalkForwardBacktester {
         homeWinAccuracy: 0,
         drawAccuracy: 0,
         awayWinAccuracy: 0,
+        naiveHomeWinBaseline: 0,
         modelComparison: [],
         testedTimeRange: { start: new Date(), end: new Date() },
       };
     }
 
-    const allTeams = await db.select().from(teams);
+    const allTeams = await db.select({ id: teams.id, canonicalName: teams.canonicalName }).from(teams);
     const teamMap = new Map<number, string>(allTeams.map((t) => [t.id, t.canonicalName]));
+
+    const teamStates = new Map<number, RollingTeamState>();
+    const getOrCreateState = (teamId: number): RollingTeamState => {
+      let state = teamStates.get(teamId);
+      if (!state) {
+        state = { elo: 1500, played: 0, recentGoalsFor: [], recentGoalsAgainst: [] };
+        teamStates.set(teamId, state);
+      }
+      return state;
+    };
+
+    const computeStrengths = (state: RollingTeamState) => {
+      const n = state.recentGoalsFor.length;
+      if (n === 0) {
+        return { attack: 100, defense: 100 };
+      }
+      const avgScored = state.recentGoalsFor.reduce((a, b) => a + b, 0) / n;
+      const avgConceded = state.recentGoalsAgainst.reduce((a, b) => a + b, 0) / n;
+      const w = 6;
+      const smoothedScored = (n * avgScored + w * 1.3) / (n + w);
+      const smoothedConceded = (n * avgConceded + w * 1.3) / (n + w);
+      return {
+        attack: Math.max(65, Math.min(140, (smoothedScored / 1.3) * 100)),
+        defense: Math.max(65, Math.min(140, 100 + ((1.3 - smoothedConceded) / 1.3) * 35)),
+      };
+    };
+
+    const evalStartIndex = Math.max(0, allFinished.length - limit);
+    const evaluatedMatches: typeof allFinished = [];
 
     let correct = 0;
     let totalBrier = 0;
@@ -78,85 +135,176 @@ export class WalkForwardBacktester {
     let awayCorrect = 0;
     let awayTotal = 0;
 
-    for (const m of testMatches) {
-      const actual = m.result as 'HOME_WIN' | 'DRAW' | 'AWAY_WIN';
-      const homeName = teamMap.get(m.homeTeamId) || 'Home Team';
-      const awayName = teamMap.get(m.awayTeamId) || 'Away Team';
+    // Independent accumulators for every individual model
+    const subStats = {
+      dixonColes: { correct: 0, brier: 0 },
+      elo: { correct: 0, brier: 0 },
+      poisson: { correct: 0, brier: 0 },
+      monteCarlo: { correct: 0, brier: 0 },
+    };
 
-      // Strictly pre-match simulation (no score leakage)
-      const pred = PredictionEngine.calculatePrediction({
-        homeTeam: homeName,
-        awayTeam: awayName,
-        competition: 'Historical League',
-        venue: m.venue || 'Stadium',
-        kickoffTime: m.kickoffTime,
-        homeElo: 1540,
-        awayElo: 1510,
-        homeAttack: 105,
-        awayAttack: 98,
-        homeDefense: 102,
-        awayDefense: 97,
-        sampleMatchesCount: 15,
-      });
+    for (let idx = 0; idx < allFinished.length; idx++) {
+      const m = allFinished[idx];
+      const homeState = getOrCreateState(m.homeTeamId);
+      const awayState = getOrCreateState(m.awayTeamId);
 
-      // Grade ensemble
-      let topPick: 'HOME_WIN' | 'DRAW' | 'AWAY_WIN' = 'HOME_WIN';
-      if (pred.prediction.draw > pred.prediction.homeWin && pred.prediction.draw > pred.prediction.awayWin) {
-        topPick = 'DRAW';
-      } else if (pred.prediction.awayWin > pred.prediction.homeWin && pred.prediction.awayWin > pred.prediction.draw) {
-        topPick = 'AWAY_WIN';
+      // 1. Predict strictly BEFORE updating with this match's actual outcome
+      if (idx >= evalStartIndex && m.homeTeamId !== m.awayTeamId) {
+        const actual = m.result as 'HOME_WIN' | 'DRAW' | 'AWAY_WIN';
+        const homeName = teamMap.get(m.homeTeamId) || 'Home Team';
+        const awayName = teamMap.get(m.awayTeamId) || 'Away Team';
+
+        const homeStr = computeStrengths(homeState);
+        const awayStr = computeStrengths(awayState);
+        const priorSample = homeState.played + awayState.played;
+
+        const pred = PredictionEngine.calculatePrediction({
+          homeTeam: homeName,
+          awayTeam: awayName,
+          competition: 'Historical League',
+          venue: m.venue || 'Stadium',
+          kickoffTime: m.kickoffTime,
+          homeElo: Number(homeState.elo.toFixed(1)),
+          awayElo: Number(awayState.elo.toFixed(1)),
+          homeAttack: Number(homeStr.attack.toFixed(1)),
+          awayAttack: Number(awayStr.attack.toFixed(1)),
+          homeDefense: Number(homeStr.defense.toFixed(1)),
+          awayDefense: Number(awayStr.defense.toFixed(1)),
+          sampleMatchesCount: priorSample,
+          hasTeamRatings: priorSample > 0,
+        });
+
+        const topPick = topPickFromProbs(pred.prediction);
+        if (topPick === actual) correct++;
+
+        if (actual === 'HOME_WIN') {
+          homeTotal++;
+          if (topPick === 'HOME_WIN') homeCorrect++;
+        } else if (actual === 'DRAW') {
+          drawTotal++;
+          if (topPick === 'DRAW') drawCorrect++;
+        } else {
+          awayTotal++;
+          if (topPick === 'AWAY_WIN') awayCorrect++;
+        }
+
+        totalBrier += ProbabilityCalibrator.calculateBrierScore(
+          pred.prediction.homeWin,
+          pred.prediction.draw,
+          pred.prediction.awayWin,
+          actual
+        );
+        totalLogLoss += ProbabilityCalibrator.calculateLogLoss(
+          pred.prediction.homeWin,
+          pred.prediction.draw,
+          pred.prediction.awayWin,
+          actual
+        );
+
+        // Grade each sub-model independently
+        const gradeSubModel = (
+          key: keyof typeof subStats,
+          probs: { homeWin: number; draw: number; awayWin: number }
+        ) => {
+          if (topPickFromProbs(probs) === actual) subStats[key].correct++;
+          subStats[key].brier += ProbabilityCalibrator.calculateBrierScore(
+            probs.homeWin,
+            probs.draw,
+            probs.awayWin,
+            actual
+          );
+        };
+
+        gradeSubModel('dixonColes', pred.models.dixonColes);
+        gradeSubModel('elo', pred.models.elo);
+        gradeSubModel('poisson', pred.models.poisson);
+        gradeSubModel('monteCarlo', pred.models.monteCarlo);
+
+        evaluatedMatches.push(m);
       }
 
-      if (topPick === actual) correct++;
+      // 2. Update rolling Elo & goal history AFTER prediction step
+      const hGoals = m.homeScoreFullTime ?? 0;
+      const aGoals = m.awayScoreFullTime ?? 0;
+      const actualHomeOutcome = hGoals > aGoals ? 1 : hGoals === aGoals ? 0.5 : 0;
+      const expectedHome = 1 / (1 + Math.pow(10, (awayState.elo - (homeState.elo + 65)) / 400));
+      const gd = Math.abs(hGoals - aGoals);
+      const goalMult = gd >= 3 ? 1.5 : gd === 2 ? 1.25 : 1.0;
+      const eloDelta = 24 * goalMult * (actualHomeOutcome - expectedHome);
 
-      // Market breakdown
-      if (actual === 'HOME_WIN') {
-        homeTotal++;
-        if (topPick === 'HOME_WIN') homeCorrect++;
-      } else if (actual === 'DRAW') {
-        drawTotal++;
-        if (topPick === 'DRAW') drawCorrect++;
-      } else {
-        awayTotal++;
-        if (topPick === 'AWAY_WIN') awayCorrect++;
-      }
+      homeState.elo += eloDelta;
+      awayState.elo -= eloDelta;
+      homeState.played++;
+      awayState.played++;
 
-      const bs = ProbabilityCalibrator.calculateBrierScore(
-        pred.prediction.homeWin,
-        pred.prediction.draw,
-        pred.prediction.awayWin,
-        actual
-      );
-      const ll = ProbabilityCalibrator.calculateLogLoss(
-        pred.prediction.homeWin,
-        pred.prediction.draw,
-        pred.prediction.awayWin,
-        actual
-      );
+      homeState.recentGoalsFor.push(hGoals);
+      homeState.recentGoalsAgainst.push(aGoals);
+      if (homeState.recentGoalsFor.length > 20) homeState.recentGoalsFor.shift();
+      if (homeState.recentGoalsAgainst.length > 20) homeState.recentGoalsAgainst.shift();
 
-      totalBrier += bs;
-      totalLogLoss += ll;
+      awayState.recentGoalsFor.push(aGoals);
+      awayState.recentGoalsAgainst.push(hGoals);
+      if (awayState.recentGoalsFor.length > 20) awayState.recentGoalsFor.shift();
+      if (awayState.recentGoalsAgainst.length > 20) awayState.recentGoalsAgainst.shift();
     }
 
-    const N = testMatches.length;
+    const N = evaluatedMatches.length;
+    if (N === 0) {
+      return {
+        totalMatchesTested: 0,
+        correctPredictions: 0,
+        overallAccuracy: 0,
+        avgBrierScore: 0,
+        avgLogLoss: 0,
+        homeWinAccuracy: 0,
+        drawAccuracy: 0,
+        awayWinAccuracy: 0,
+        naiveHomeWinBaseline: 0,
+        modelComparison: [],
+        testedTimeRange: { start: new Date(), end: new Date() },
+      };
+    }
+
     return {
       totalMatchesTested: N,
       correctPredictions: correct,
       overallAccuracy: Number((correct / N).toFixed(3)),
       avgBrierScore: Number((totalBrier / N).toFixed(4)),
       avgLogLoss: Number((totalLogLoss / N).toFixed(4)),
-      homeWinAccuracy: homeTotal > 0 ? Number((homeCorrect / homeTotal).toFixed(3)) : 0.70,
-      drawAccuracy: drawTotal > 0 ? Number((drawCorrect / drawTotal).toFixed(3)) : 0.35,
-      awayWinAccuracy: awayTotal > 0 ? Number((awayCorrect / awayTotal).toFixed(3)) : 0.62,
+      homeWinAccuracy: homeTotal > 0 ? Number((homeCorrect / homeTotal).toFixed(3)) : 0,
+      drawAccuracy: drawTotal > 0 ? Number((drawCorrect / drawTotal).toFixed(3)) : 0,
+      awayWinAccuracy: awayTotal > 0 ? Number((awayCorrect / awayTotal).toFixed(3)) : 0,
+      naiveHomeWinBaseline: Number((homeTotal / N).toFixed(3)),
       modelComparison: [
-        { name: 'Ensemble (Production)', accuracy: Number((correct / N).toFixed(3)), brierScore: Number((totalBrier / N).toFixed(4)) },
-        { name: 'Dixon-Coles Model', accuracy: Number(((correct * 0.95) / N).toFixed(3)), brierScore: Number(((totalBrier * 1.08) / N).toFixed(4)) },
-        { name: 'Dynamic Elo Model', accuracy: Number(((correct * 0.92) / N).toFixed(3)), brierScore: Number(((totalBrier * 1.12) / N).toFixed(4)) },
-        { name: 'Bivariate Poisson Model', accuracy: Number(((correct * 0.90) / N).toFixed(3)), brierScore: Number(((totalBrier * 1.15) / N).toFixed(4)) },
+        {
+          name: 'Ensemble (Production)',
+          accuracy: Number((correct / N).toFixed(3)),
+          brierScore: Number((totalBrier / N).toFixed(4)),
+        },
+        {
+          name: 'Dixon-Coles Model',
+          accuracy: Number((subStats.dixonColes.correct / N).toFixed(3)),
+          brierScore: Number((subStats.dixonColes.brier / N).toFixed(4)),
+        },
+        {
+          name: 'Dynamic Elo Model',
+          accuracy: Number((subStats.elo.correct / N).toFixed(3)),
+          brierScore: Number((subStats.elo.brier / N).toFixed(4)),
+        },
+        {
+          name: 'Bivariate Poisson Model',
+          accuracy: Number((subStats.poisson.correct / N).toFixed(3)),
+          brierScore: Number((subStats.poisson.brier / N).toFixed(4)),
+        },
+        {
+          name: 'Monte Carlo (5k)',
+          accuracy: Number((subStats.monteCarlo.correct / N).toFixed(3)),
+          brierScore: Number((subStats.monteCarlo.brier / N).toFixed(4)),
+        },
       ],
       testedTimeRange: {
-        start: testMatches[0].kickoffTime,
-        end: testMatches[testMatches.length - 1].kickoffTime,
+        start: evaluatedMatches[0].kickoffTime,
+        end: evaluatedMatches[evaluatedMatches.length - 1].kickoffTime,
       },
     };
   }

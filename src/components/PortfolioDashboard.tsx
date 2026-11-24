@@ -18,6 +18,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import { PortfolioStore, PortfolioState, TrackedBet } from '../data/portfolio/portfolioStore.ts';
+import { useAuth } from '../context/AuthContext.tsx';
 
 interface PortfolioDashboardProps {
   onOpenBetSlip: () => void;
@@ -25,10 +26,12 @@ interface PortfolioDashboardProps {
 }
 
 export const PortfolioDashboard: React.FC<PortfolioDashboardProps> = ({ onOpenBetSlip, onNotify }) => {
+  const { user, isFirebaseReady } = useAuth();
   const [portfolio, setPortfolio] = useState<PortfolioState>(PortfolioStore.getState());
   const [filterStatus, setFilterStatus] = useState<'ALL' | 'OPEN' | 'WON' | 'LOST' | 'VOID'>('ALL');
   const [isEditingBankroll, setIsEditingBankroll] = useState<boolean>(false);
   const [newBankrollInput, setNewBankrollInput] = useState<string>('');
+  const [confirmingReset, setConfirmingReset] = useState<boolean>(false);
 
   useEffect(() => {
     const unsub = PortfolioStore.subscribe((state) => {
@@ -66,6 +69,17 @@ export const PortfolioDashboard: React.FC<PortfolioDashboardProps> = ({ onOpenBe
             </span>
             <span className="text-slate-600 text-xs">·</span>
             <span className="text-slate-400 text-xs">Fractional Kelly Bankroll Tracking</span>
+            <span className="text-slate-600 text-xs">·</span>
+            {user ? (
+              <span className="text-emerald-400 text-xs flex items-center gap-1 font-medium">
+                <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                <span>Firestore Synced ({user.email?.split('@')[0]})</span>
+              </span>
+            ) : (
+              <span className="text-slate-500 text-xs">
+                Local Vault {isFirebaseReady ? '(Sign in to Sync)' : ''}
+              </span>
+            )}
           </div>
           <h1 className="text-xl sm:text-2xl font-bold text-white tracking-tight mt-0.5">
             Quantitative Portfolio & Bankroll Terminal
@@ -197,18 +211,35 @@ export const PortfolioDashboard: React.FC<PortfolioDashboardProps> = ({ onOpenBe
           )}
         </div>
 
-        <button
-          onClick={() => {
-            if (confirm('Reset portfolio to initial $1,000 capital?')) {
-              PortfolioStore.resetPortfolio(1000);
-              if (onNotify) onNotify('Portfolio reset to initial $1,000 baseline.');
-            }
-          }}
-          className="flex items-center gap-1.5 text-slate-400 hover:text-rose-400 transition cursor-pointer"
-        >
-          <RotateCcw className="w-3.5 h-3.5" />
-          <span>Reset Portfolio</span>
-        </button>
+        {confirmingReset ? (
+          <div className="flex items-center gap-2">
+            <span className="text-rose-300 font-medium">Reset to $1,000?</span>
+            <button
+              onClick={() => {
+                PortfolioStore.resetPortfolio(1000);
+                setConfirmingReset(false);
+                if (onNotify) onNotify('Portfolio reset to initial $1,000 baseline.');
+              }}
+              className="px-2.5 py-1 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded cursor-pointer"
+            >
+              Confirm
+            </button>
+            <button
+              onClick={() => setConfirmingReset(false)}
+              className="px-2 py-1 text-slate-400 hover:text-white cursor-pointer"
+            >
+              Cancel
+            </button>
+          </div>
+        ) : (
+          <button
+            onClick={() => setConfirmingReset(true)}
+            className="flex items-center gap-1.5 text-slate-400 hover:text-rose-400 transition cursor-pointer"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            <span>Reset Portfolio</span>
+          </button>
+        )}
       </div>
 
       {/* Bets Ledger Section */}

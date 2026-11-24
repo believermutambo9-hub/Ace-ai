@@ -1,96 +1,23 @@
-import { and, desc, eq, gt, gte, lt, lte } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray } from 'drizzle-orm';
 import { db } from '../../db/index.ts';
 import {
   competitions,
   evidenceSnapshots,
+  historicalOdds,
   matches,
   predictionLedger,
   seasons,
-  teamRatings,
   teams,
 } from '../../db/schema.ts';
 import { PredictionEngine } from '../../models/engine.ts';
 import { HistoricalEvidenceEngine } from '../../evidence/historical/h2hEngine.ts';
 import { WebIntelligenceEngine } from '../../evidence/web/webIntelligence.ts';
+import { FootballDataProvider } from '../providers/footballDataProvider.ts';
+import { ApiFootballProvider } from '../providers/apiFootballProvider.ts';
+import { IdentityResolver } from '../identity/resolver.ts';
 
-export type PredictionQueueStatus = 'READY' | 'PENDING' | 'NOT_YET_GENERATED';
-
-export interface UpcomingMatchItem {
-  id: number;
-  externalId: string;
-  competitionId: number;
-  competitionName: string;
-  competitionCode: string;
-  round: string | number;
-  venue: string;
-  kickoffTime: string;
-  kickoffDate: string;
-  startsInMinutes: number;
-  startsInFormatted: string;
-  status: 'SCHEDULED' | 'UPCOMING' | 'LIVE' | 'FINISHED' | 'POSTPONED' | 'CANCELLED';
-  homeTeamId: number;
-  homeTeam: string;
-  homeShortName: string;
-  awayTeamId: number;
-  awayTeam: string;
-  awayShortName: string;
-  queueStatus: PredictionQueueStatus;
-  isLocked: boolean;
-  prediction?: {
-    ledgerId: number;
-    modelVersion: string;
-    versionNumber: number;
-    predictionTimestamp: string;
-    isLocked: boolean;
-    probabilities: {
-      homeWin: number;
-      draw: number;
-      awayWin: number;
-    };
-    expectedGoals: {
-      home: number;
-      away: number;
-      total: number;
-    };
-    fairOdds: {
-      home: number;
-      draw: number;
-      away: number;
-    };
-    mostLikelyScore: string;
-    confidenceScore: number;
-    confidenceLevel: 'HIGH' | 'MEDIUM' | 'LOW';
-    confidenceReason: string;
-    dataQuality: {
-      score: number;
-      rating: 'EXCELLENT' | 'GOOD' | 'MODERATE' | 'LIMITED';
-      factors: string[];
-    };
-    totalVersionsCount: number;
-  };
-}
-
-export interface UpcomingDashboardResponse {
-  currentTime: string;
-  requestedHoursWindow: number | null;
-  windowsSummary: {
-    next1Hour: number;
-    next2Hours: number;
-    next3Hours: number;
-    next4Hours: number;
-    next5Hours: number;
-    today: number;
-    tomorrow: number;
-    totalUpcoming: number;
-  };
-  queueSummary: {
-    ready: number;
-    pending: number;
-    notYetGenerated: number;
-    total: number;
-  };
-  matches: UpcomingMatchItem[];
-}
+import type { PredictionQueueStatus, UpcomingMatchItem, UpcomingDashboardResponse } from '../../types/football.ts';
+export type { PredictionQueueStatus, UpcomingMatchItem, UpcomingDashboardResponse };
 
 export class UpcomingEngine {
   private static isEnsuring: boolean = false;
@@ -110,159 +37,136 @@ export class UpcomingEngine {
   /**
    * Ensures realistic dynamic fixtures exist relative to current time across time horizons.
    */
+  /**
+   * Synchronizes real upcoming fixtures from active configured providers into PostgreSQL.
+   * CRITICAL INTEGRITY: Never artificially shifts kickoff times or creates fake fixtures.
+   * Real fixtures maintain their verified official kickoff timestamp.
+   */
   public static async ensureUpcomingFixtures(): Promise<void> {
     if (this.isEnsuring) return;
     this.isEnsuring = true;
 
     try {
       const now = new Date();
-      // Look for scheduled matches in the future
-      const futureMatches = await db
-        .select()
+      // Check if we have sufficient verified upcoming scheduled fixtures
+      const existingScheduled = await db
+        .select({ id: matches.id })
         .from(matches)
         .where(
           and(
             eq(matches.status, 'SCHEDULED'),
-            gt(matches.kickoffTime, now)
+            gte(matches.kickoffTime, new Date(now.getTime() - 15 * 60 * 1000))
           )
-        );
+        )
+        .limit(5);
 
-      // If we have at least 5 matches scheduled in the future, we're in good shape
-      if (futureMatches.length >= 6) {
-        return;
+      if (existingScheduled.length >= 5) {
+        return; // Database already holds active upcoming fixtures
       }
 
-      // Query necessary teams
-      const allTeams = await db.select().from(teams);
-      const teamMap = new Map(allTeams.map((t) => [t.canonicalName, t.id]));
-      const allComps = await db.select().from(competitions);
-      const compMap = new Map(allComps.map((c) => [c.code, c.id]));
-      const allSeasons = await db.select().from(seasons);
-      const seasonMap = new Map(allSeasons.map((s) => [s.competitionId, s.id]));
-
-      const upcomingFixturesDef = [
-        {
-          compCode: 'PL',
-          home: 'Arsenal FC',
-          away: 'Chelsea FC',
-          offsetMinutes: 38, // Next 1 hour
-          venue: 'Emirates Stadium',
-          round: 'Matchday 29',
-        },
-        {
-          compCode: 'PD',
-          home: 'Real Madrid CF',
-          away: 'FC Barcelona',
-          offsetMinutes: 95, // Next 2 hours (1h 35m)
-          venue: 'Santiago Bernabéu',
-          round: 'Matchday 32',
-        },
-        {
-          compCode: 'PL',
-          home: 'Manchester City FC',
-          away: 'Liverpool FC',
-          offsetMinutes: 160, // Next 3 hours (2h 40m)
-          venue: 'Etihad Stadium',
-          round: 'Matchday 30',
-        },
-        {
-          compCode: 'BL1',
-          home: 'FC Bayern München',
-          away: 'Borussia Dortmund',
-          offsetMinutes: 230, // Next 4 hours (3h 50m)
-          venue: 'Allianz Arena',
-          round: 'Matchday 26',
-        },
-        {
-          compCode: 'SA',
-          home: 'Juventus FC',
-          away: 'FC Internazionale Milano',
-          offsetMinutes: 290, // Next 5 hours (4h 50m)
-          venue: 'Allianz Stadium (Torino)',
-          round: 'Matchday 28',
-        },
-        {
-          compCode: 'FL1',
-          home: 'Paris Saint-Germain FC',
-          away: 'Olympique de Marseille',
-          offsetMinutes: 440, // 7h 20m (Tonight)
-          venue: 'Parc des Princes',
-          round: 'Matchday 27',
-        },
-        {
-          compCode: 'BSA',
-          home: 'CR Flamengo',
-          away: 'SE Palmeiras',
-          offsetMinutes: 1440, // +24 hours (Tomorrow)
-          venue: 'Maracanã',
-          round: 'Rodada 14',
-        },
-        {
-          compCode: 'ARG',
-          home: 'CA River Plate',
-          away: 'CA Boca Juniors',
-          offsetMinutes: 1800, // +30 hours (Tomorrow)
-          venue: 'El Monumental',
-          round: 'Fecha 15',
-        },
-      ];
-
-      for (const fix of upcomingFixturesDef) {
-        const homeId = teamMap.get(fix.home);
-        const awayId = teamMap.get(fix.away);
-        const compId = compMap.get(fix.compCode);
-        const seasonId = compId ? seasonMap.get(compId) || 1 : 1;
-
-        if (!homeId || !awayId || !compId) continue;
-
-        const kickoffTime = new Date(now.getTime() + fix.offsetMinutes * 60 * 1000);
-
-        // Check if fixture already exists in scheduled state
-        const [existing] = await db
-          .select()
-          .from(matches)
-          .where(
-            and(
-              eq(matches.homeTeamId, homeId),
-              eq(matches.awayTeamId, awayId),
-              eq(matches.status, 'SCHEDULED')
-            )
-          )
-          .limit(1);
-
-        if (existing) {
-          // If kickoff has expired, adjust it forward to keep demo fresh
-          if (new Date(existing.kickoffTime) <= now) {
-            await db
-              .update(matches)
-              .set({
-                kickoffTime,
-                round: fix.round,
-                venue: fix.venue,
-              })
-              .where(eq(matches.id, existing.id));
-          }
-        } else {
-          await db.insert(matches).values({
-            providerSource: 'UPCOMING_ENGINE',
-            competitionId: compId,
-            seasonId,
-            externalId: `UPCOMING_${fix.compCode}_${homeId}_${awayId}_${Date.now()}`,
-            homeTeamId: homeId,
-            awayTeamId: awayId,
-            round: fix.round,
-            kickoffTime,
-            status: 'SCHEDULED',
-            venue: fix.venue,
-            metadata: {
-              upcomingTier: fix.offsetMinutes <= 120 ? 'HIGH_PRIORITY' : 'STANDARD',
-              broadcast: 'Worldwide Live Satellite Feeds',
-            },
-          });
+      // Query active providers for genuine upcoming fixtures
+      let rawMatches: any[] = [];
+      if (process.env.FOOTBALL_DATA_API_KEY) {
+        try {
+          const fd = new FootballDataProvider();
+          rawMatches = await fd.fetchUpcomingMatches();
+        } catch (e: any) {
+          console.warn('[UpcomingEngine] Football-Data sync notice:', e?.message);
         }
       }
-    } catch (err) {
-      console.error('Failed to ensure upcoming fixtures:', err);
+
+      if (rawMatches.length === 0 && process.env.API_FOOTBALL_KEY && !ApiFootballProvider.isInCircuitBreakerCooldown()) {
+        try {
+          const apiFootball = new ApiFootballProvider();
+          rawMatches = await apiFootball.fetchUpcomingFixtures({ date: now.toISOString().split('T')[0] });
+        } catch (e: any) {
+          console.warn('[UpcomingEngine] API-Football sync notice:', e?.message);
+        }
+      }
+
+      if (rawMatches.length < 5) {
+        try {
+          const { LiveWebFeedProvider } = await import('../providers/liveWebFeedProvider.ts');
+          const webFeed = new LiveWebFeedProvider();
+          const bundle = await webFeed.fetchWebScoreboardBundle();
+          const webUpcoming = bundle.upcoming.map((item) => webFeed.toNormalizedMatch(item));
+          if (webUpcoming.length > 0) {
+            rawMatches = [...rawMatches, ...webUpcoming];
+          }
+        } catch (e: any) {
+          console.warn('[UpcomingEngine] Live Web Feed sync notice:', e?.message);
+        }
+      }
+
+      if (rawMatches.length === 0) return;
+
+      // Ingest into PostgreSQL with deduplication and identity resolution
+      for (const m of rawMatches.slice(0, 30)) {
+        try {
+          const [comp] = await db
+            .select()
+            .from(competitions)
+            .where(eq(competitions.code, m.competitionCode))
+            .limit(1);
+
+          if (!comp) continue;
+
+          let [season] = await db
+            .select()
+            .from(seasons)
+            .where(and(eq(seasons.competitionId, comp.id), eq(seasons.seasonCode, m.seasonCode)))
+            .limit(1);
+
+          if (!season) {
+            const parts = String(m.seasonCode || '').split('-').map((p) => parseInt(p, 10)).filter((n) => !isNaN(n));
+            const fallbackYear = m.kickoffTime ? new Date(m.kickoffTime).getUTCFullYear() : new Date().getUTCFullYear();
+            const yearStart = parts[0] || fallbackYear;
+            const yearEnd = parts[1] || yearStart;
+            const [newSeason] = await db
+              .insert(seasons)
+              .values({
+                competitionId: comp.id,
+                seasonCode: m.seasonCode,
+                yearStart,
+                yearEnd,
+                isCurrent: true,
+              })
+              .returning();
+            season = newSeason;
+          }
+
+          const home = await IdentityResolver.resolveTeam(m.homeTeamRawName, comp.country, m.providerSource);
+          const away = await IdentityResolver.resolveTeam(m.awayTeamRawName, comp.country, m.providerSource);
+
+          const [existing] = await db
+            .select({ id: matches.id })
+            .from(matches)
+            .where(and(eq(matches.providerSource, m.providerSource), eq(matches.externalId, m.externalId)))
+            .limit(1);
+
+          if (!existing) {
+            await db.insert(matches).values({
+              externalId: m.externalId,
+              providerSource: m.providerSource,
+              competitionId: comp.id,
+              seasonId: season.id,
+              round: m.round,
+              matchday: m.matchday,
+              kickoffTime: m.kickoffTime,
+              homeTeamId: home.id,
+              awayTeamId: away.id,
+              venue: m.venue,
+              status: m.status,
+              result: m.result,
+              metadata: m.metadata,
+            });
+          }
+        } catch (err: any) {
+          // Continue with remaining matches
+        }
+      }
+    } catch (err: any) {
+      console.warn('[UpcomingEngine] ensureUpcomingFixtures notice:', err?.message);
     } finally {
       this.isEnsuring = false;
     }
@@ -346,37 +250,35 @@ export class UpcomingEngine {
       throw new Error('Team records missing for this fixture.');
     }
 
-    // Query team ratings
-    const [homeRating] = await db
-      .select()
-      .from(teamRatings)
-      .where(eq(teamRatings.teamId, homeTeam.id))
-      .orderBy(desc(teamRatings.ratingTimestamp))
-      .limit(1);
-
-    const [awayRating] = await db
-      .select()
-      .from(teamRatings)
-      .where(eq(teamRatings.teamId, awayTeam.id))
-      .orderBy(desc(teamRatings.ratingTimestamp))
-      .limit(1);
-
-    const homeElo = homeRating?.overallElo ?? 1560;
-    const awayElo = awayRating?.overallElo ?? 1520;
-    const homeAttack = homeRating?.attackRating ?? 105;
-    const awayAttack = awayRating?.attackRating ?? 98;
-    const homeDefense = homeRating?.defenseRating ?? 102;
-    const awayDefense = awayRating?.defenseRating ?? 96;
-
-    // Retrieve historical evidence
-    const [h2hSummary, homeForm, awayForm, webNews] = await Promise.all([
-      HistoricalEvidenceEngine.getH2HRecord(homeTeam.id, awayTeam.id),
-      HistoricalEvidenceEngine.getTeamForm(homeTeam.id, true),
-      HistoricalEvidenceEngine.getTeamForm(awayTeam.id, false),
-      WebIntelligenceEngine.gatherPreMatchIntelligence(homeTeam.canonicalName, awayTeam.canonicalName, kickoffDate),
+    // Resolve pre-kickoff ratings & historical evidence strictly prior to kickoff
+    const [homeRating, awayRating, h2hSummary, homeForm, awayForm, webNews, storedOdds] = await Promise.all([
+      HistoricalEvidenceEngine.getEffectiveTeamRating(homeTeam.id, kickoffDate),
+      HistoricalEvidenceEngine.getEffectiveTeamRating(awayTeam.id, kickoffDate),
+      HistoricalEvidenceEngine.getH2HRecord(homeTeam.id, awayTeam.id, kickoffDate),
+      HistoricalEvidenceEngine.getTeamForm(homeTeam.id, true, kickoffDate),
+      HistoricalEvidenceEngine.getTeamForm(awayTeam.id, false, kickoffDate),
+      WebIntelligenceEngine.gatherPreMatchIntelligence(
+        homeTeam.canonicalName,
+        awayTeam.canonicalName,
+        kickoffDate,
+        comp?.code
+      ),
+      db
+        .select()
+        .from(historicalOdds)
+        .where(and(eq(historicalOdds.matchId, matchRecord.id), eq(historicalOdds.marketType, 'MATCH_WINNER'))),
     ]);
 
-    // Count existing prediction versions for this match
+    let resolvedMarketOdds = options?.marketOdds;
+    if (!resolvedMarketOdds && storedOdds.length >= 3) {
+      const hOdd = storedOdds.find((o) => o.selection === 'HOME')?.decimalOdds;
+      const dOdd = storedOdds.find((o) => o.selection === 'DRAW')?.decimalOdds;
+      const aOdd = storedOdds.find((o) => o.selection === 'AWAY')?.decimalOdds;
+      if (hOdd && dOdd && aOdd && hOdd > 1 && dOdd > 1 && aOdd > 1) {
+        resolvedMarketOdds = { homeOdds: hOdd, drawOdds: dOdd, awayOdds: aOdd };
+      }
+    }
+
     const existingLedgers = await db
       .select({ id: predictionLedger.id, modelVersion: predictionLedger.modelVersion })
       .from(predictionLedger)
@@ -385,25 +287,29 @@ export class UpcomingEngine {
 
     const versionIndex = existingLedgers.length + 1;
     const versionLabel = options?.modelVersion || `v${versionIndex}-institutional-ensemble`;
+    const sampleCount = homeForm.sampleMatches + awayForm.sampleMatches + h2hSummary.totalH2HMatches;
+    const hasRatings = !homeRating.isBaselineDefault || !awayRating.isBaselineDefault;
 
-    // Run Prediction Engine
     const predictionResult = PredictionEngine.calculatePrediction({
       homeTeam: homeTeam.canonicalName,
       awayTeam: awayTeam.canonicalName,
       competition: comp ? comp.name : 'Top Flight',
       venue: matchRecord.venue || homeTeam.venueName || 'Main Stadium',
       kickoffTime: kickoffDate,
-      homeElo,
-      awayElo,
-      homeAttack,
-      awayAttack,
-      homeDefense,
-      awayDefense,
-      sampleMatchesCount: homeForm.sampleMatches + awayForm.sampleMatches,
-      absences: options?.customAbsences,
-      marketOdds: options?.marketOdds,
-      homeContext: { daysRest: 6, travelDistanceKm: 0, playedMidweekEuropean: false },
-      awayContext: { daysRest: 6, travelDistanceKm: 150, playedMidweekEuropean: false },
+      homeElo: homeRating.overallElo,
+      awayElo: awayRating.overallElo,
+      homeAttack: homeRating.attackRating,
+      awayAttack: awayRating.attackRating,
+      homeDefense: homeRating.defenseRating,
+      awayDefense: awayRating.defenseRating,
+      sampleMatchesCount: sampleCount,
+      absences: options?.customAbsences && options.customAbsences.length > 0
+        ? options.customAbsences
+        : webNews.verifiedAbsences,
+      marketOdds: resolvedMarketOdds,
+      hasTeamRatings: hasRatings,
+      hasWebIntelligence: webNews.retrievalStatus !== 'UNAVAILABLE',
+      webIntelligenceReliability: webNews.overallIntelligenceReliability,
     });
 
     // Create Pre-Match Immutable Snapshot
@@ -430,6 +336,7 @@ export class UpcomingEngine {
         webIntelligenceData: webNews,
         sourceReliabilityScore: webNews.overallIntelligenceReliability,
         dataQualityScore: predictionResult.dataQuality.score,
+        missingFields: predictionResult.dataQuality.missingInputs || [],
         isImmutable: true,
       })
       .returning();
@@ -519,18 +426,37 @@ export class UpcomingEngine {
     const allTeams = await db.select().from(teams);
     const teamMap = new Map(allTeams.map((t) => [t.id, t]));
 
-    // Query all ledger predictions for these upcoming matches
-    const allLedger = await db
-      .select()
-      .from(predictionLedger)
-      .orderBy(desc(predictionLedger.predictionTimestamp));
-
+    const upcomingMatchIds = rawUpcoming.map((m) => m.id);
     const ledgerByMatchId = new Map<number, any[]>();
-    for (const row of allLedger) {
-      if (!ledgerByMatchId.has(row.matchId)) {
-        ledgerByMatchId.set(row.matchId, []);
+    const snapshotMap = new Map<number, typeof evidenceSnapshots.$inferSelect>();
+
+    if (upcomingMatchIds.length > 0) {
+      const relevantLedger = await db
+        .select()
+        .from(predictionLedger)
+        .where(inArray(predictionLedger.matchId, upcomingMatchIds))
+        .orderBy(desc(predictionLedger.predictionTimestamp));
+
+      const snapshotIds: number[] = [];
+      for (const row of relevantLedger) {
+        if (!ledgerByMatchId.has(row.matchId)) {
+          ledgerByMatchId.set(row.matchId, []);
+          if (typeof row.snapshotId === 'number') {
+            snapshotIds.push(row.snapshotId);
+          }
+        }
+        ledgerByMatchId.get(row.matchId)!.push(row);
       }
-      ledgerByMatchId.get(row.matchId)!.push(row);
+
+      if (snapshotIds.length > 0) {
+        const snaps = await db
+          .select()
+          .from(evidenceSnapshots)
+          .where(inArray(evidenceSnapshots.id, snapshotIds));
+        for (const s of snaps) {
+          snapshotMap.set(s.id, s);
+        }
+      }
     }
 
     // Windows calculation
@@ -593,11 +519,26 @@ export class UpcomingEngine {
         const drawProb = latestLedger.drawProb;
         const awayProb = latestLedger.awayWinProb;
 
+        const snap = latestLedger.snapshotId ? snapshotMap.get(latestLedger.snapshotId) : undefined;
+        const storedQuality = snap?.dataQualityScore ?? latestLedger.confidenceScore ?? 0.5;
+        const qualityRating =
+          storedQuality >= 0.80
+            ? ('EXCELLENT' as const)
+            : storedQuality >= 0.65
+            ? ('GOOD' as const)
+            : storedQuality >= 0.45
+            ? ('MODERATE' as const)
+            : ('LIMITED' as const);
+        const missingFields = Array.isArray(snap?.missingFields) ? (snap.missingFields as string[]) : [];
+        const confScore = latestLedger.confidenceScore ?? 0.5;
+
         predictionSummary = {
           ledgerId: latestLedger.id,
           modelVersion: latestLedger.modelVersion,
           versionNumber: matchLedgers.length,
-          predictionTimestamp: latestLedger.predictionTimestamp ? new Date(latestLedger.predictionTimestamp).toISOString() : new Date().toISOString(),
+          predictionTimestamp: latestLedger.predictionTimestamp
+            ? new Date(latestLedger.predictionTimestamp).toISOString()
+            : new Date().toISOString(),
           isLocked: diffMs <= 0,
           probabilities: {
             homeWin: homeProb,
@@ -615,18 +556,20 @@ export class UpcomingEngine {
             away: awayProb > 0 ? parseFloat((1 / awayProb).toFixed(2)) : 0,
           },
           mostLikelyScore: latestLedger.mostLikelyScore,
-          confidenceScore: latestLedger.confidenceScore ?? 0.82,
+          confidenceScore: confScore,
           confidenceLevel:
-            (latestLedger.confidenceScore ?? 0.8) >= 0.85
+            confScore >= 0.78 && qualityRating === 'EXCELLENT'
               ? ('HIGH' as const)
-              : (latestLedger.confidenceScore ?? 0.8) >= 0.70
+              : confScore >= 0.55
               ? ('MEDIUM' as const)
               : ('LOW' as const),
-          confidenceReason: latestLedger.confidenceReason ?? 'Calculated using calibrated Dixon-Coles and Elo rating spreads.',
+          confidenceReason:
+            latestLedger.confidenceReason ??
+            'Calculated using historical Elo ratings and Dixon-Coles ensemble probabilities.',
           dataQuality: {
-            score: 0.92,
-            rating: 'EXCELLENT' as const,
-            factors: ['Official Competition Records', 'Verified Lineup Rosters', 'Live Elo Spreads'],
+            score: Number(storedQuality.toFixed(2)),
+            rating: qualityRating,
+            factors: missingFields.length > 0 ? missingFields : ['Pre-match DB snapshot persisted'],
           },
           totalVersionsCount: matchLedgers.length,
         };

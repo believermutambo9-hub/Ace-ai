@@ -1,5 +1,9 @@
 // Value Bet & Kelly Criterion Quantitative Engine
-import { UpcomingMatchItem } from '../upcoming/upcomingEngine.ts';
+// CRITICAL INTEGRITY: Never fabricates bookmaker odds or generates synthetic market prices from probabilities.
+// Real market quotes are kept strictly separated from theoretical model fair prices.
+// Browser and Client-Bundle Safe: Zero database driver imports (pg, drizzle, etc.)
+
+import type { UpcomingMatchItem } from '../../types/football.ts';
 
 export interface MarketOpportunity {
   id: string;
@@ -13,15 +17,27 @@ export interface MarketOpportunity {
   selectionLabel: string;
   modelProbability: number; // e.g. 0.62 (62%)
   modelFairOdds: number; // 1 / probability e.g. 1.61
-  bookmakerOdds: number; // e.g. 1.85
-  impliedMarketProb: number; // 1 / bookmakerOdds e.g. 0.54
-  edgePercent: number; // (modelProbability * bookmakerOdds - 1) * 100
-  expectedValueUnit: number; // (modelProbability * (bookmakerOdds - 1)) - (1 - modelProbability)
-  kellyStakeFraction: number; // Full Kelly fraction f*
-  halfKellyPercent: number; // f* / 2 * 100
-  quarterKellyPercent: number; // f* / 4 * 100
+
+  // Strict separation of genuine market odds vs unquoted
+  hasRealMarketOdds: boolean;
+  bookmakerOdds: number | null; // Real market price or null
+  bookmakerName: string | null; // e.g., 'Bet365', 'Pinnacle', 'Consensus'
+  impliedMarketProb: number | null; // 1 / bookmakerOdds or null
+  edgePercent: number | null; // (modelProbability * bookmakerOdds - 1) * 100 or null
+  expectedValueUnit: number | null; // (modelProbability * (bookmakerOdds - 1)) - (1 - modelProbability) or null
+  kellyStakeFraction: number | null; // Full Kelly fraction f* or null
+  halfKellyPercent: number | null; // f* / 2 * 100 or null
+  quarterKellyPercent: number | null; // f* / 4 * 100 or null
+
   confidenceScore: number;
   dataQuality: string;
+  marketStatus: 'VERIFIED_MARKET_ODDS' | 'UNQUOTED_THEORETICAL_ONLY';
+  marketStatusNote: string;
+}
+
+export interface RealOddsQuote {
+  odds: number;
+  bookmaker: string;
 }
 
 /**
@@ -39,31 +55,30 @@ function factorial(n: number): number {
 }
 
 /**
- * Calculates synthetic consensus bookmaker odds with realistic 5.5% margin (overround)
- */
-function deriveConsensusOdds(prob: number, overround: number = 1.055): number {
-  const adjustedProb = prob * overround;
-  const rawOdds = 1 / Math.max(0.01, Math.min(0.99, adjustedProb));
-  return Math.round(rawOdds * 100) / 100;
-}
-
-/**
  * Calculates full Kelly fraction: (b * p - q) / b
  * where b = odds - 1, p = model prob, q = 1 - p
+ * Safely handles invalid or negative bounds.
  */
 export function calculateKellyFraction(modelProb: number, odds: number): number {
-  if (odds <= 1 || modelProb <= 0) return 0;
+  if (odds <= 1 || modelProb <= 0 || modelProb >= 1) return 0;
   const b = odds - 1;
   const q = 1 - modelProb;
   const f = (b * modelProb - q) / b;
-  // Clamp between 0 and 0.15 (15% max single wager for risk safety)
+  // Clamp between 0 and 0.15 (15% max single wager for bankroll preservation)
   return Math.max(0, Math.min(0.15, f));
 }
 
 /**
- * Extracts and scans value opportunities from upcoming fixtures
+ * Extracts and scans value opportunities from upcoming fixtures.
+ * CRITICAL RULE: If genuine market odds are not present in realOddsMap,
+ * it sets bookmakerOdds: null and marketStatus: 'UNQUOTED_THEORETICAL_ONLY'.
+ * It NEVER derives simulated bookmaker odds from model probabilities.
  */
-export function scanValueBetsFromMatches(matches: UpcomingMatchItem[]): MarketOpportunity[] {
+export function scanValueBetsFromMatches(
+  matches: UpcomingMatchItem[],
+  realOddsMap?: Map<string, RealOddsQuote>,
+  includeUnquotedTheoretical: boolean = true
+): MarketOpportunity[] {
   const opportunities: MarketOpportunity[] = [];
 
   for (const match of matches) {
@@ -102,34 +117,32 @@ export function scanValueBetsFromMatches(matches: UpcomingMatchItem[]): MarketOp
       selection: string;
       selectionLabel: string;
       prob: number;
-      syntheticMarketBoost: number; // simulates slight market bias (fading draws or away underdog)
     }> = [
-      { marketType: '1X2', selection: 'HOME', selectionLabel: `${match.homeTeam} to Win`, prob: homeWinP, syntheticMarketBoost: 0.96 },
-      { marketType: '1X2', selection: 'DRAW', selectionLabel: 'Draw', prob: drawP, syntheticMarketBoost: 1.05 },
-      { marketType: '1X2', selection: 'AWAY', selectionLabel: `${match.awayTeam} to Win`, prob: awayWinP, syntheticMarketBoost: 1.08 },
-      { marketType: 'TOTAL_GOALS_2_5', selection: 'OVER', selectionLabel: 'Over 2.5 Goals', prob: over25Prob, syntheticMarketBoost: 1.04 },
-      { marketType: 'TOTAL_GOALS_2_5', selection: 'UNDER', selectionLabel: 'Under 2.5 Goals', prob: under25Prob, syntheticMarketBoost: 1.03 },
-      { marketType: 'BTTS', selection: 'YES', selectionLabel: 'Both Teams to Score - Yes', prob: bttsYesProb, syntheticMarketBoost: 1.05 },
-      { marketType: 'BTTS', selection: 'NO', selectionLabel: 'Both Teams to Score - No', prob: bttsNoProb, syntheticMarketBoost: 1.02 },
-      { marketType: 'DOUBLE_CHANCE', selection: '1X', selectionLabel: `${match.homeTeam} or Draw (1X)`, prob: dc1XProb, syntheticMarketBoost: 1.03 },
-      { marketType: 'DOUBLE_CHANCE', selection: 'X2', selectionLabel: `Draw or ${match.awayTeam} (X2)`, prob: dcX2Prob, syntheticMarketBoost: 1.06 },
+      { marketType: '1X2', selection: 'HOME', selectionLabel: `${match.homeTeam} to Win`, prob: homeWinP },
+      { marketType: '1X2', selection: 'DRAW', selectionLabel: 'Draw', prob: drawP },
+      { marketType: '1X2', selection: 'AWAY', selectionLabel: `${match.awayTeam} to Win`, prob: awayWinP },
+      { marketType: 'TOTAL_GOALS_2_5', selection: 'OVER', selectionLabel: 'Over 2.5 Goals', prob: over25Prob },
+      { marketType: 'TOTAL_GOALS_2_5', selection: 'UNDER', selectionLabel: 'Under 2.5 Goals', prob: under25Prob },
+      { marketType: 'BTTS', selection: 'YES', selectionLabel: 'Both Teams to Score - Yes', prob: bttsYesProb },
+      { marketType: 'BTTS', selection: 'NO', selectionLabel: 'Both Teams to Score - No', prob: bttsNoProb },
+      { marketType: 'DOUBLE_CHANCE', selection: '1X', selectionLabel: `${match.homeTeam} or Draw (1X)`, prob: dc1XProb },
+      { marketType: 'DOUBLE_CHANCE', selection: 'X2', selectionLabel: `Draw or ${match.awayTeam} (X2)`, prob: dcX2Prob },
     ];
 
     for (const prop of propositions) {
       if (prop.prob <= 0.08) continue; // Skip near-zero events
 
       const modelFairOdds = Math.round((1 / prop.prob) * 100) / 100;
-      // Bookmaker odds with realistic market variance:
-      // When market price is higher than model fair odds, it represents positive EV
-      const bookmakerOdds = deriveConsensusOdds(prop.prob * prop.syntheticMarketBoost, 1.03);
+      const lookupKey = `${match.id}:${prop.marketType}:${prop.selection}`;
+      const realQuote = realOddsMap?.get(lookupKey);
 
-      const impliedMarketProb = Math.round((1 / bookmakerOdds) * 1000) / 1000;
-      const ev = (prop.prob * (bookmakerOdds - 1)) - (1 - prop.prob);
-      const edge = (prop.prob * bookmakerOdds - 1) * 100;
-
-      // Only include if Edge > 0% (Positive Expected Value)
-      if (edge > 0.5) {
-        const fullKelly = calculateKellyFraction(prop.prob, bookmakerOdds);
+      if (realQuote && realQuote.odds > 1.0) {
+        // Genuine bookmaker odds are verified
+        const bookmakerOdds = Math.round(realQuote.odds * 100) / 100;
+        const impliedMarketProb = Math.round((1 / bookmakerOdds) * 1000) / 1000;
+        const ev = prop.prob * (bookmakerOdds - 1) - (1 - prop.prob);
+        const edge = (prop.prob * bookmakerOdds - 1) * 100;
+        const fullKelly = edge > 0 ? calculateKellyFraction(prop.prob, bookmakerOdds) : 0;
 
         opportunities.push({
           id: `${match.id}-${prop.marketType}-${prop.selection}`,
@@ -143,7 +156,9 @@ export function scanValueBetsFromMatches(matches: UpcomingMatchItem[]): MarketOp
           selectionLabel: prop.selectionLabel,
           modelProbability: Math.round(prop.prob * 1000) / 1000,
           modelFairOdds,
+          hasRealMarketOdds: true,
           bookmakerOdds,
+          bookmakerName: realQuote.bookmaker,
           impliedMarketProb,
           edgePercent: Math.round(edge * 10) / 10,
           expectedValueUnit: Math.round(ev * 1000) / 1000,
@@ -152,11 +167,49 @@ export function scanValueBetsFromMatches(matches: UpcomingMatchItem[]): MarketOp
           quarterKellyPercent: Math.round((fullKelly / 4) * 1000) / 10,
           confidenceScore,
           dataQuality: dataQuality?.rating || 'GOOD',
+          marketStatus: 'VERIFIED_MARKET_ODDS',
+          marketStatusNote: `Verified ${realQuote.bookmaker} quote: ${bookmakerOdds.toFixed(2)} (Fair: ${modelFairOdds.toFixed(2)})`,
+        });
+      } else if (includeUnquotedTheoretical) {
+        // Market odds unquoted: Expose theoretical model fair odds with strict nulls on market prices
+        opportunities.push({
+          id: `${match.id}-${prop.marketType}-${prop.selection}`,
+          matchId: match.id,
+          homeTeam: match.homeTeam,
+          awayTeam: match.awayTeam,
+          competition: match.competitionName,
+          kickoffTime: match.kickoffTime,
+          marketType: prop.marketType,
+          selection: prop.selection,
+          selectionLabel: prop.selectionLabel,
+          modelProbability: Math.round(prop.prob * 1000) / 1000,
+          modelFairOdds,
+          hasRealMarketOdds: false,
+          bookmakerOdds: null,
+          bookmakerName: null,
+          impliedMarketProb: null,
+          edgePercent: null,
+          expectedValueUnit: null,
+          kellyStakeFraction: null,
+          halfKellyPercent: null,
+          quarterKellyPercent: null,
+          confidenceScore,
+          dataQuality: dataQuality?.rating || 'GOOD',
+          marketStatus: 'UNQUOTED_THEORETICAL_ONLY',
+          marketStatusNote:
+            'Market odds unquoted. Theoretical model fair price shown for analytical reference only; market EV cannot be claimed without verified bookmaker odds.',
         });
       }
     }
   }
 
-  // Sort by highest Edge descending
-  return opportunities.sort((a, b) => b.edgePercent - a.edgePercent);
+  // Sort: verified positive edge first (descending), then unquoted by highest model probability
+  return opportunities.sort((a, b) => {
+    if (a.hasRealMarketOdds && b.hasRealMarketOdds) {
+      return (b.edgePercent || 0) - (a.edgePercent || 0);
+    }
+    if (a.hasRealMarketOdds && !b.hasRealMarketOdds) return -1;
+    if (!a.hasRealMarketOdds && b.hasRealMarketOdds) return 1;
+    return b.modelProbability - a.modelProbability;
+  });
 }

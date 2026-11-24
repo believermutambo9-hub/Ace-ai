@@ -14,7 +14,7 @@ import {
   BarChart3,
   Flame,
 } from 'lucide-react';
-import { UpcomingMatchItem } from '../data/upcoming/upcomingEngine.ts';
+import type { UpcomingMatchItem } from '../types/football.ts';
 import { PortfolioStore } from '../data/portfolio/portfolioStore.ts';
 import { calculateKellyFraction } from '../data/valueBets/valueBetEngine.ts';
 
@@ -34,14 +34,21 @@ export const MatchTacticalDossierModal: React.FC<MatchTacticalDossierModalProps>
   const [awayAbsenceImpact, setAwayAbsenceImpact] = useState<number>(0);
   const [addedMarket, setAddedMarket] = useState<string | null>(null);
 
-  if (!match) return null;
+  const basePred = match?.prediction;
+  const hasRealExpectedGoals =
+    typeof basePred?.expectedGoals?.home === 'number' &&
+    typeof basePred?.expectedGoals?.away === 'number' &&
+    basePred.expectedGoals.home > 0 &&
+    basePred.expectedGoals.away > 0;
+  const baseHomeLambda = hasRealExpectedGoals ? basePred!.expectedGoals.home : null;
+  const baseAwayMu = hasRealExpectedGoals ? basePred!.expectedGoals.away : null;
 
-  const basePred = match.prediction;
-  const baseHomeLambda = basePred?.expectedGoals?.home || 1.45;
-  const baseAwayMu = basePred?.expectedGoals?.away || 1.15;
-
-  // Dynamically simulated values when user adjusts squad absences
+  // Dynamically simulated values when user adjusts squad absences (always executed unconditionally per Rules of Hooks)
   const simulated = useMemo(() => {
+    if (baseHomeLambda === null || baseAwayMu === null) {
+      return null;
+    }
+
     const adjHomeLambda = Math.max(0.2, baseHomeLambda * (1 - homeAbsenceImpact / 100));
     const adjAwayMu = Math.max(0.2, baseAwayMu * (1 - awayAbsenceImpact / 100));
 
@@ -90,15 +97,11 @@ export const MatchTacticalDossierModal: React.FC<MatchTacticalDossierModalProps>
     };
   }, [baseHomeLambda, baseAwayMu, homeAbsenceImpact, awayAbsenceImpact]);
 
-  // Synthetic Form & 15-Min Timing (grounded in historical statistical averages)
-  const goalIntervals = [
-    { interval: "0'–15'", home: 12, away: 8 },
-    { interval: "16'–30'", home: 18, away: 15 },
-    { interval: "31'–45'", home: 24, away: 20 },
-    { interval: "46'–60'", home: 16, away: 14 },
-    { interval: "61'–75'", home: 22, away: 19 },
-    { interval: "76'–90+'", home: 28, away: 24 },
-  ];
+  if (!match) return null;
+
+  // Poisson score grid summary (computed directly from adjusted expected goals)
+  const cleanSheetHome = simulated ? Math.exp(-simulated.awayMu) : 0;
+  const cleanSheetAway = simulated ? Math.exp(-simulated.homeLambda) : 0;
 
   const handleAddBet = (
     marketType: string,
@@ -172,6 +175,15 @@ export const MatchTacticalDossierModal: React.FC<MatchTacticalDossierModalProps>
         </div>
 
         {/* Scrollable Content */}
+        {!simulated ? (
+          <div className="p-10 text-center space-y-3 text-slate-300">
+            <AlertTriangle className="w-8 h-8 text-amber-400 mx-auto" />
+            <h3 className="text-sm font-bold text-white">Prediction Not Yet Generated</h3>
+            <p className="text-xs text-slate-400 max-w-md mx-auto">
+              Generate a quantitative prediction for this fixture in the Upcoming Prediction Queue before running Poisson absence simulations or adding paper bets.
+            </p>
+          </div>
+        ) : (
         <div className="p-6 space-y-6 overflow-y-auto text-slate-200 text-sm">
           {/* Key Probabilities & Expected Goals Strip */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -288,44 +300,46 @@ export const MatchTacticalDossierModal: React.FC<MatchTacticalDossierModalProps>
             </div>
           </div>
 
-          {/* Goal Distribution Timing (15-Minute Game Intervals) */}
+          {/* Derived Poisson Market Probabilities & Data Transparency */}
           <div className="bg-slate-900/60 border border-slate-800/80 rounded-xl p-4.5 space-y-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <Clock className="w-4 h-4 text-emerald-400" />
+                <BarChart3 className="w-4 h-4 text-emerald-400" />
                 <h3 className="text-xs font-semibold text-white uppercase tracking-wider">
-                  Goal Distribution Timing Matrix (15-Minute Windows)
+                  Derived Poisson Markets &amp; Data Scope
                 </h3>
               </div>
-              <span className="text-[11px] text-slate-400">
-                <span className="text-emerald-400 font-bold">■</span> {match.homeTeam} &nbsp;{' '}
-                <span className="text-sky-400 font-bold">■</span> {match.awayTeam}
+              <span className="text-[11px] font-mono text-slate-400">
+                Bivariate Goal Grid (0–6 Goals)
               </span>
             </div>
 
-            <div className="grid grid-cols-6 gap-2 pt-2">
-              {goalIntervals.map((g) => (
-                <div key={g.interval} className="bg-slate-950/70 p-2.5 rounded-lg border border-slate-800/60 text-center">
-                  <span className="text-[10px] text-slate-400 font-mono block mb-2">{g.interval}</span>
-                  <div className="flex items-end justify-center gap-1.5 h-16">
-                    <div
-                      className="w-3.5 bg-emerald-500/80 rounded-t transition-all"
-                      style={{ height: `${Math.min(100, g.home * 2.5)}%` }}
-                      title={`${match.homeTeam}: ${g.home}% of goals`}
-                    />
-                    <div
-                      className="w-3.5 bg-sky-500/80 rounded-t transition-all"
-                      style={{ height: `${Math.min(100, g.away * 2.5)}%` }}
-                      title={`${match.awayTeam}: ${g.away}% of goals`}
-                    />
-                  </div>
-                  <div className="flex justify-between text-[9px] font-mono text-slate-500 mt-1.5">
-                    <span>{g.home}%</span>
-                    <span>{g.away}%</span>
-                  </div>
-                </div>
-              ))}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs font-mono">
+              <div className="bg-slate-950/70 p-3 rounded-lg border border-slate-800/60">
+                <span className="text-[10px] text-slate-400 block">Over 2.5 Goals</span>
+                <strong className="text-white text-sm">{(simulated.over25P * 100).toFixed(1)}%</strong>
+                <span className="text-[10px] text-slate-500 block">Fair @ {(1 / simulated.over25P).toFixed(2)}</span>
+              </div>
+              <div className="bg-slate-950/70 p-3 rounded-lg border border-slate-800/60">
+                <span className="text-[10px] text-slate-400 block">BTTS (Yes)</span>
+                <strong className="text-white text-sm">{(simulated.bttsP * 100).toFixed(1)}%</strong>
+                <span className="text-[10px] text-slate-500 block">Fair @ {(1 / simulated.bttsP).toFixed(2)}</span>
+              </div>
+              <div className="bg-slate-950/70 p-3 rounded-lg border border-slate-800/60">
+                <span className="text-[10px] text-slate-400 block">{match.homeTeam} Clean Sheet</span>
+                <strong className="text-emerald-400 text-sm">{(cleanSheetHome * 100).toFixed(1)}%</strong>
+                <span className="text-[10px] text-slate-500 block">exp(-awayMu)</span>
+              </div>
+              <div className="bg-slate-950/70 p-3 rounded-lg border border-slate-800/60">
+                <span className="text-[10px] text-slate-400 block">{match.awayTeam} Clean Sheet</span>
+                <strong className="text-sky-400 text-sm">{(cleanSheetAway * 100).toFixed(1)}%</strong>
+                <span className="text-[10px] text-slate-500 block">exp(-homeLambda)</span>
+              </div>
             </div>
+
+            <p className="text-[11px] text-slate-500">
+              Note: Minute-by-minute goal timing splits are omitted when event-level goal-minute timestamps are unavailable from historical providers.
+            </p>
           </div>
 
           {/* Quick Bet Slip Adders */}
@@ -342,7 +356,7 @@ export const MatchTacticalDossierModal: React.FC<MatchTacticalDossierModalProps>
                     'HOME',
                     `${match.homeTeam} to Win`,
                     simulated.homeWinP,
-                    Math.round(simulated.fairOddsHome * 1.05 * 100) / 100
+                    simulated.fairOddsHome
                   )
                 }
                 className="flex items-center justify-between p-3 rounded-lg bg-slate-950/80 hover:bg-emerald-950/30 border border-slate-800 hover:border-emerald-500/40 transition cursor-pointer text-left"
@@ -350,7 +364,7 @@ export const MatchTacticalDossierModal: React.FC<MatchTacticalDossierModalProps>
                 <div>
                   <span className="text-xs font-semibold text-white block">{match.homeTeam} Win</span>
                   <span className="text-[11px] text-slate-400 font-mono">
-                    P({Math.round(simulated.homeWinP * 100)}%) · Odds {(simulated.fairOddsHome * 1.05).toFixed(2)}
+                    P({Math.round(simulated.homeWinP * 100)}%) · Fair @ {simulated.fairOddsHome.toFixed(2)} (Paper)
                   </span>
                 </div>
                 <span className="text-xs font-medium text-emerald-400">
@@ -365,7 +379,7 @@ export const MatchTacticalDossierModal: React.FC<MatchTacticalDossierModalProps>
                     'OVER',
                     'Over 2.5 Goals',
                     simulated.over25P,
-                    Math.round((1 / simulated.over25P) * 1.05 * 100) / 100
+                    Math.round((1 / simulated.over25P) * 100) / 100
                   )
                 }
                 className="flex items-center justify-between p-3 rounded-lg bg-slate-950/80 hover:bg-emerald-950/30 border border-slate-800 hover:border-emerald-500/40 transition cursor-pointer text-left"
@@ -373,7 +387,7 @@ export const MatchTacticalDossierModal: React.FC<MatchTacticalDossierModalProps>
                 <div>
                   <span className="text-xs font-semibold text-white block">Over 2.5 Goals</span>
                   <span className="text-[11px] text-slate-400 font-mono">
-                    P({Math.round(simulated.over25P * 100)}%) · Odds {((1 / simulated.over25P) * 1.05).toFixed(2)}
+                    P({Math.round(simulated.over25P * 100)}%) · Fair @ {(1 / simulated.over25P).toFixed(2)} (Paper)
                   </span>
                 </div>
                 <span className="text-xs font-medium text-emerald-400">
@@ -388,7 +402,7 @@ export const MatchTacticalDossierModal: React.FC<MatchTacticalDossierModalProps>
                     'YES',
                     'Both Teams to Score (Yes)',
                     simulated.bttsP,
-                    Math.round((1 / simulated.bttsP) * 1.05 * 100) / 100
+                    Math.round((1 / simulated.bttsP) * 100) / 100
                   )
                 }
                 className="flex items-center justify-between p-3 rounded-lg bg-slate-950/80 hover:bg-emerald-950/30 border border-slate-800 hover:border-emerald-500/40 transition cursor-pointer text-left"
@@ -396,7 +410,7 @@ export const MatchTacticalDossierModal: React.FC<MatchTacticalDossierModalProps>
                 <div>
                   <span className="text-xs font-semibold text-white block">BTTS (Yes)</span>
                   <span className="text-[11px] text-slate-400 font-mono">
-                    P({Math.round(simulated.bttsP * 100)}%) · Odds {((1 / simulated.bttsP) * 1.05).toFixed(2)}
+                    P({Math.round(simulated.bttsP * 100)}%) · Fair @ {(1 / simulated.bttsP).toFixed(2)} (Paper)
                   </span>
                 </div>
                 <span className="text-xs font-medium text-emerald-400">
@@ -406,6 +420,7 @@ export const MatchTacticalDossierModal: React.FC<MatchTacticalDossierModalProps>
             </div>
           </div>
         </div>
+        )}
 
         {/* Modal Footer */}
         <div className="px-6 py-3 border-t border-slate-800/80 bg-slate-900/60 flex items-center justify-between shrink-0">

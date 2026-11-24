@@ -343,11 +343,12 @@ export class ComprehensiveHistoryIngestion {
     // Log the comprehensive mass sync to ingestion_logs
     await db.insert(ingestionLogs).values({
       providerSource: 'comprehensive-mass-history',
-      status: report.errors.length > 0 ? 'PARTIAL_SUCCESS' : 'SUCCESS',
+      action: 'MASS_HISTORY_INGESTION',
+      status: report.errors.length > 0 ? 'WARNING' : 'SUCCESS',
       recordsProcessed: report.totalProcessed,
       recordsInserted: report.totalInserted,
       recordsUpdated: report.totalUpdated,
-      errors: report.errors.length > 0 ? report.errors : null,
+      details: { errors: report.errors.length > 0 ? report.errors : [] },
     });
 
     notify(`Comprehensive ingestion complete! Inserted: ${report.totalInserted}, Updated: ${report.totalUpdated}, Total processed: ${report.totalProcessed}`);

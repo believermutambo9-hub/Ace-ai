@@ -1,0 +1,223 @@
+// PitchIntel Football Intelligence — Architecture Documentation
+// NOTICE: Authoritative runtime schema is maintained in `src/db/schema.ts` via Drizzle ORM.
+// PitchIntel uses Drizzle ORM and node-postgres directly. Prisma is retained for architectural
+// reference only and is not loaded into runtime memory or migrations.
+// Database Engine: PostgreSQL 18+ (Google Cloud SQL / Render / Supabase)
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Competition {
+  id        Int      @id @default(autoincrement())
+  externalId String  @unique @map("external_id")
+  name      String
+  code      String   @unique
+  country   String
+  tier      Int      @default(1)
+  logoUrl   String?  @map("logo_url")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  seasons   Season[]
+  matches   Match[]
+
+  @@map("competitions")
+}
+
+model Team {
+  id            Int      @id @default(autoincrement())
+  canonicalName String   @unique @map("canonical_name")
+  shortName     String   @map("short_name")
+  tla           String?
+  country       String
+  founded       Int?
+  venueName     String?  @map("venue_name")
+  crest         String?
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  aliases        TeamAlias[]
+  homeMatches    Match[]           @relation("HomeMatches")
+  awayMatches    Match[]           @relation("AwayMatches")
+  matchStats     MatchStatistic[]
+  ratings        TeamRating[]
+
+  @@map("teams")
+}
+
+model TeamAlias {
+  id             Int      @id @default(autoincrement())
+  teamId         Int      @map("team_id")
+  aliasName      String   @map("alias_name")
+  providerSource String   @map("provider_source")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  team           Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@index([aliasName], name: "team_aliases_alias_idx")
+  @@index([teamId], name: "team_aliases_team_idx")
+  @@map("team_aliases")
+}
+
+model Season {
+  id            Int      @id @default(autoincrement())
+  competitionId Int      @map("competition_id")
+  seasonCode    String   @map("season_code")
+  yearStart     Int      @map("year_start")
+  yearEnd       Int      @map("year_end")
+  isCurrent     Boolean  @default(false) @map("is_current")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  competition   Competition @relation(fields: [competitionId], references: [id], onDelete: Cascade)
+  matches       Match[]
+
+  @@index([competitionId, seasonCode], name: "seasons_comp_code_idx")
+  @@map("seasons")
+}
+
+model Match {
+  id                Int       @id @default(autoincrement())
+  externalId        String    @unique @map("external_id")
+  competitionId     Int       @map("competition_id")
+  seasonId          Int       @map("season_id")
+  round             String?
+  kickoffTime       DateTime  @map("kickoff_time") @db.Timestamptz
+  status            String    // 'SCHEDULED' | 'LIVE' | 'FINISHED' | 'POSTPONED'
+  homeTeamId        Int       @map("home_team_id")
+  awayTeamId        Int       @map("away_team_id")
+  homeScoreFullTime Int?      @map("home_score_full_time")
+  awayScoreFullTime Int?      @map("away_score_full_time")
+  homeScoreHalfTime Int?      @map("home_score_half_time")
+  awayScoreHalfTime Int?      @map("away_score_half_time")
+  result            String?   // 'HOME_WIN' | 'DRAW' | 'AWAY_WIN'
+  venue             String?
+  metadata          Json?
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  competition       Competition        @relation(fields: [competitionId], references: [id], onDelete: Cascade)
+  season            Season             @relation(fields: [seasonId], references: [id], onDelete: Cascade)
+  homeTeam          Team               @relation("HomeMatches", fields: [homeTeamId], references: [id], onDelete: Cascade)
+  awayTeam          Team               @relation("AwayMatches", fields: [awayTeamId], references: [id], onDelete: Cascade)
+  statistics        MatchStatistic[]
+  evidenceSnapshots EvidenceSnapshot[]
+  predictions       PredictionLedger[]
+
+  @@index([competitionId, kickoffTime], name: "matches_comp_kickoff_idx")
+  @@index([homeTeamId, awayTeamId], name: "matches_teams_idx")
+  @@index([status], name: "matches_status_idx")
+  @@map("matches")
+}
+
+model MatchStatistic {
+  id          Int      @id @default(autoincrement())
+  matchId     Int      @map("match_id")
+  teamId      Int      @map("team_id")
+  isHome      Boolean  @map("is_home")
+  possession  Float?
+  shots       Int?
+  shotsOnTarget Int?   @map("shots_on_target")
+  corners     Int?
+  fouls       Int?
+  yellowCards Int?     @map("yellow_cards")
+  redCards    Int?     @map("red_cards")
+  xg          Float?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  match       Match    @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  team        Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@index([matchId], name: "match_statistics_match_idx")
+  @@map("match_statistics")
+}
+
+model TeamRating {
+  id              Int      @id @default(autoincrement())
+  teamId          Int      @map("team_id")
+  overallElo      Float    @default(1500.0) @map("overall_elo")
+  homeElo         Float    @default(1500.0) @map("home_elo")
+  awayElo         Float    @default(1500.0) @map("away_elo")
+  attackRating    Float    @default(100.0) @map("attack_rating")
+  defenseRating   Float    @default(100.0) @map("defense_rating")
+  matchesPlayed   Int      @default(0) @map("matches_played")
+  ratingTimestamp DateTime @default(now()) @map("rating_timestamp") @db.Timestamptz
+
+  team            Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@index([teamId, ratingTimestamp], name: "team_ratings_team_time_idx")
+  @@map("team_ratings")
+}
+
+model EvidenceSnapshot {
+  id                     Int       @id @default(autoincrement())
+  matchId                Int       @map("match_id")
+  snapshotTimestamp      DateTime  @default(now()) @map("snapshot_timestamp") @db.Timestamptz
+  h2hData                Json?     @map("h2h_data")
+  recentFormData         Json?     @map("recent_form_data")
+  webIntelligenceData    Json?     @map("web_intelligence_data")
+  sourceReliabilityScore Float?    @map("source_reliability_score")
+  dataQualityScore       Float?    @map("data_quality_score")
+  missingFields          Json?     @map("missing_fields")
+  isImmutable            Boolean   @default(true) @map("is_immutable")
+  createdAt              DateTime  @default(now()) @map("created_at")
+
+  match                  Match     @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  predictions            PredictionLedger[]
+
+  @@index([matchId], name: "evidence_snapshots_match_idx")
+  @@map("evidence_snapshots")
+}
+
+model PredictionLedger {
+  id                Int       @id @default(autoincrement())
+  matchId           Int       @map("match_id")
+  snapshotId        Int?      @map("snapshot_id")
+  modelVersion      String    @map("model_version")
+  predictionTimestamp DateTime @default(now()) @map("prediction_timestamp") @db.Timestamptz
+  kickoffTime       DateTime  @map("kickoff_time") @db.Timestamptz
+  isLocked          Boolean   @default(false) @map("is_locked")
+  homeWinProb       Float     @map("home_win_prob")
+  drawProb          Float     @map("draw_prob")
+  awayWinProb       Float     @map("away_win_prob")
+  homeExpectedGoals Float     @map("home_expected_goals")
+  awayExpectedGoals Float     @map("away_expected_goals")
+  mostLikelyScore   String    @map("most_likely_score")
+  scoreMatrix       Json?     @map("score_matrix")
+  confidenceScore   Float     @map("confidence_score")
+  confidenceLevel   String    @map("confidence_level")
+  confidenceReason  String?   @map("confidence_reason")
+  actualResult      String?   @map("actual_result")
+  actualScore       String?   @map("actual_score")
+  wasCorrect        Boolean?  @map("was_correct")
+  brierScore        Float?    @map("brier_score")
+  logLoss           Float?    @map("log_loss")
+  createdAt         DateTime  @default(now()) @map("created_at")
+
+  match             Match     @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  snapshot          EvidenceSnapshot? @relation(fields: [snapshotId], references: [id], onDelete: SetNull)
+
+  @@index([matchId], name: "prediction_ledger_match_idx")
+  @@index([kickoffTime], name: "prediction_ledger_kickoff_idx")
+  @@map("prediction_ledger")
+}
+
+model IngestionLog {
+  id                Int      @id @default(autoincrement())
+  providerSource    String   @map("provider_source")
+  action            String
+  status            String   // 'SUCCESS' | 'WARNING' | 'ERROR'
+  recordsProcessed  Int      @default(0) @map("records_processed")
+  recordsInserted   Int      @default(0) @map("records_inserted")
+  recordsUpdated    Int      @default(0) @map("records_updated")
+  conflictsDetected Int      @default(0) @map("conflicts_detected")
+  details           Json?
+  timestamp         DateTime @default(now()) @map("timestamp") @db.Timestamptz
+
+  @@index([timestamp], name: "ingestion_logs_time_idx")
+  @@index([providerSource], name: "ingestion_logs_source_idx")
+  @@map("ingestion_logs")
+}

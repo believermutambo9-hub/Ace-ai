@@ -1,7 +1,7 @@
 import React from 'react';
 import { X, Download, Printer, FileText, CheckCircle2 } from 'lucide-react';
 import { MarketOpportunity } from '../data/valueBets/valueBetEngine.ts';
-import { UpcomingMatchItem } from '../data/upcoming/upcomingEngine.ts';
+import type { UpcomingMatchItem } from '../types/football.ts';
 
 interface SyndicateExportModalProps {
   opportunities: MarketOpportunity[];
@@ -44,12 +44,12 @@ export const SyndicateExportModal: React.FC<SyndicateExportModalProps> = ({
       `"${opp.selectionLabel}"`,
       Math.round(opp.modelProbability * 100),
       opp.modelFairOdds.toFixed(2),
-      opp.bookmakerOdds.toFixed(2),
-      `+${opp.edgePercent}%`,
-      opp.expectedValueUnit.toFixed(3),
-      `${opp.quarterKellyPercent}%`,
-      `${opp.halfKellyPercent}%`,
-      `${Math.round(opp.kellyStakeFraction * 1000) / 10}%`,
+      opp.hasRealMarketOdds && opp.bookmakerOdds !== null ? opp.bookmakerOdds.toFixed(2) : 'Unquoted',
+      opp.edgePercent !== null ? `+${opp.edgePercent}%` : 'N/A',
+      opp.expectedValueUnit !== null ? opp.expectedValueUnit.toFixed(3) : 'N/A',
+      opp.quarterKellyPercent !== null ? `${opp.quarterKellyPercent}%` : 'N/A',
+      opp.halfKellyPercent !== null ? `${opp.halfKellyPercent}%` : 'N/A',
+      opp.kellyStakeFraction !== null ? `${Math.round(opp.kellyStakeFraction * 1000) / 10}%` : 'N/A',
       opp.dataQuality,
     ]);
 
@@ -58,7 +58,7 @@ export const SyndicateExportModal: React.FC<SyndicateExportModalProps> = ({
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.setAttribute('href', url);
-    link.setAttribute('download', `KickProphet_Syndicate_Report_${new Date().toISOString().slice(0, 10)}.csv`);
+    link.setAttribute('download', `PitchIntel_Syndicate_Report_${new Date().toISOString().slice(0, 10)}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -137,9 +137,17 @@ export const SyndicateExportModal: React.FC<SyndicateExportModalProps> = ({
                     </td>
                     <td className="p-2.5 font-sans">{opp.selectionLabel}</td>
                     <td className="p-2.5">{Math.round(opp.modelProbability * 100)}%</td>
-                    <td className="p-2.5">{opp.bookmakerOdds.toFixed(2)}</td>
-                    <td className="p-2.5 text-emerald-400 font-bold print:text-emerald-700">+{opp.edgePercent}%</td>
-                    <td className="p-2.5 text-slate-400">{opp.halfKellyPercent}%</td>
+                    <td className="p-2.5">
+                      {opp.hasRealMarketOdds && opp.bookmakerOdds !== null
+                        ? opp.bookmakerOdds.toFixed(2)
+                        : 'Unquoted'}
+                    </td>
+                    <td className="p-2.5 text-emerald-400 font-bold print:text-emerald-700">
+                      {opp.edgePercent !== null ? `+${opp.edgePercent}%` : 'Fair Price'}
+                    </td>
+                    <td className="p-2.5 text-slate-400">
+                      {opp.halfKellyPercent !== null ? `${opp.halfKellyPercent}%` : '—'}
+                    </td>
                   </tr>
                 ))}
               </tbody>

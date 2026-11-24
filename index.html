@@ -3,31 +3,53 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Football Intelligence & Prediction Engine</title>
-    <meta name="description" content="Evidence-based worldwide football intelligence, dynamic ratings, statistical modeling, simulation, and backtesting engine." />
-    <meta property="og:title" content="Football Intelligence & Prediction Engine" />
-    <meta property="og:description" content="Evidence-based worldwide football intelligence, dynamic ratings, statistical modeling, simulation, and backtesting engine." />
+    <title>PitchIntel — Football Intelligence & Prediction Engine</title>
+    <meta name="description" content="PitchIntel: Evidence-based worldwide football intelligence, dynamic ratings, statistical modeling, simulation, and backtesting engine." />
+    <meta property="og:title" content="PitchIntel — Football Intelligence & Prediction Engine" />
+    <meta property="og:description" content="PitchIntel: Evidence-based worldwide football intelligence, dynamic ratings, statistical modeling, simulation, and backtesting engine." />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="theme-color" content="#060913" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <meta name="apple-mobile-web-app-title" content="KickProphet" />
+    <meta name="apple-mobile-web-app-title" content="PitchIntel" />
+    <link rel="manifest" href="/manifest.json" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <link rel="icon" type="image/svg+xml" href="/icon.svg" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
     <script>
+      // Browser-safe Buffer fallback for client runtime
+      if (typeof window !== 'undefined' && typeof window.Buffer === 'undefined') {
+        window.Buffer = {
+          isBuffer: function() { return false; },
+          from: function(data) {
+            if (typeof data === 'string') return new TextEncoder().encode(data);
+            return new Uint8Array(data);
+          },
+          alloc: function(size) { return new Uint8Array(size); },
+        };
+      }
       // Ignore WebSocket disconnection errors in iframe preview
+      function isViteWsError(msg) {
+        if (typeof msg !== 'string') return false;
+        return (
+          msg.includes('WebSocket') ||
+          msg.includes('vite:ws') ||
+          msg.includes('createWebSocketModuleRunnerTransport')
+        );
+      }
       window.addEventListener('unhandledrejection', function (e) {
-        if (e && e.reason && typeof e.reason.message === 'string' && (e.reason.message.includes('WebSocket') || e.reason.message.includes('vite:ws'))) {
+        var msg = e && e.reason ? (e.reason.message || String(e.reason)) : '';
+        if (isViteWsError(msg)) {
           e.preventDefault();
         }
       });
       window.addEventListener('error', function (e) {
-        if (e && e.message && (e.message.includes('WebSocket') || e.message.includes('vite:ws'))) {
+        var msg = e ? (e.message || (e.error && e.error.message) || '') : '';
+        if (isViteWsError(msg)) {
           e.preventDefault();
         }
       });

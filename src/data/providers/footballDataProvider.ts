@@ -197,6 +197,102 @@ export class FootballDataProvider extends BaseFootballDataProvider implements IF
     }
   }
 
+  /**
+   * Fetch upcoming matches across major competitions for a date range (defaults to next 7 days)
+   */
+  async fetchUpcomingMatches(dateFrom?: string, dateTo?: string): Promise<NormalizedMatch[]> {
+    if (!this.apiKey) return [];
+    try {
+      const now = new Date();
+      const dFrom = dateFrom || now.toISOString().split('T')[0];
+      const nextWeek = new Date(now.getTime() + 7 * 86400000);
+      const dTo = dateTo || nextWeek.toISOString().split('T')[0];
+
+      const url = `${this.baseUrl}/matches?dateFrom=${encodeURIComponent(dFrom)}&dateTo=${encodeURIComponent(dTo)}`;
+      const res = await this.fetchWithRetry(url, { headers: this.getHeaders() });
+      if (!res.ok) {
+        console.error(`[${this.name}] Failed to fetch upcoming matches: HTTP ${res.status}`);
+        return [];
+      }
+
+      const data = await res.json();
+      const rawMatches = data.matches || [];
+
+      return rawMatches.map((m: any) => this.normalizeFdMatch(m));
+    } catch (err: any) {
+      console.error(`[${this.name}] Error fetching upcoming matches:`, err.message);
+      return [];
+    }
+  }
+
+  /**
+   * Fetch live in-play matches from Football-Data.org
+   */
+  async fetchLiveMatches(): Promise<NormalizedMatch[]> {
+    if (!this.apiKey) return [];
+    try {
+      const url = `${this.baseUrl}/matches?status=IN_PLAY,PAUSED`;
+      const res = await this.fetchWithRetry(url, { headers: this.getHeaders() });
+      if (!res.ok) {
+        console.error(`[${this.name}] Failed to fetch live matches: HTTP ${res.status}`);
+        return [];
+      }
+
+      const data = await res.json();
+      const rawMatches = data.matches || [];
+      return rawMatches.map((m: any) => this.normalizeFdMatch(m));
+    } catch (err: any) {
+      console.error(`[${this.name}] Error fetching live matches:`, err.message);
+      return [];
+    }
+  }
+
+  private normalizeFdMatch(m: any): NormalizedMatch {
+    let status: MatchStatus = 'SCHEDULED';
+    if (m.status === 'FINISHED') status = 'FINISHED';
+    else if (m.status === 'IN_PLAY' || m.status === 'PAUSED') status = 'LIVE';
+    else if (m.status === 'POSTPONED') status = 'POSTPONED';
+    else if (m.status === 'CANCELLED') status = 'CANCELLED';
+
+    let result: MatchResult | null = null;
+    if (m.score?.winner === 'HOME_TEAM') result = 'HOME_WIN';
+    else if (m.score?.winner === 'AWAY_TEAM') result = 'AWAY_WIN';
+    else if (m.score?.winner === 'DRAW') result = 'DRAW';
+
+    return {
+      externalId: `fd_${m.id}`,
+      providerSource: 'football-data-org',
+      competitionCode: m.competition?.code || 'INT',
+      seasonCode: m.season?.startDate
+        ? `${m.season.startDate.slice(0, 4)}-${m.season.endDate?.slice(0, 4) || ''}`
+        : '2024-2025',
+      round: m.stage || (m.matchday ? `Matchday ${m.matchday}` : undefined),
+      matchday: m.matchday,
+      kickoffTime: new Date(m.utcDate),
+      homeTeamRawName: m.homeTeam?.name || 'Home Team',
+      awayTeamRawName: m.awayTeam?.name || 'Away Team',
+      venue: m.venue || undefined,
+      referee: m.referees?.[0]?.name,
+      status,
+      homeScoreHalfTime: m.score?.halfTime?.home ?? null,
+      awayScoreHalfTime: m.score?.halfTime?.away ?? null,
+      homeScoreFullTime: m.score?.fullTime?.home ?? null,
+      awayScoreFullTime: m.score?.fullTime?.away ?? null,
+      result,
+      metadata: {
+        homeTeamId: m.homeTeam?.id,
+        awayTeamId: m.awayTeam?.id,
+        homeTeamCrest: m.homeTeam?.crest,
+        awayTeamCrest: m.awayTeam?.crest,
+        homeTeamTla: m.homeTeam?.tla,
+        awayTeamTla: m.awayTeam?.tla,
+        homeTeamShortName: m.homeTeam?.shortName,
+        awayTeamShortName: m.awayTeam?.shortName,
+        lastUpdated: m.lastUpdated,
+      },
+    };
+  }
+
   async fetchMatchStats(_matchExternalId: string): Promise<NormalizedMatchStats | null> {
     // Football-Data.org free tier does not provide detailed shot xG statistics per match
     return null;

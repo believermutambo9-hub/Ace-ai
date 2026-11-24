@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { UpcomingEngine } from '../../data/upcoming/upcomingEngine.ts';
 import { ProbabilityTrendEngine } from '../../data/upcoming/trendEngine.ts';
+import { requireAdminOrService } from '../../middleware/auth.ts';
 
 export const upcomingRouter = Router();
 
@@ -105,7 +106,7 @@ upcomingRouter.get('/predictions/:matchId/trend', async (req: Request, res: Resp
 });
 
 // POST /api/upcoming/predictions/:matchId/ingest
-upcomingRouter.post('/predictions/:matchId/ingest', async (req: Request, res: Response) => {
+upcomingRouter.post('/predictions/:matchId/ingest', requireAdminOrService, async (req: Request, res: Response) => {
   try {
     const matchId = parseInt(req.params.matchId, 10);
     if (isNaN(matchId)) return res.status(400).json({ error: 'Invalid match ID' });

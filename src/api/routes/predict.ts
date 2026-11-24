@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { and, desc, eq, or } from 'drizzle-orm';
+import { and, eq, or } from 'drizzle-orm';
 import { z } from 'zod';
 import { db } from '../../db/index.ts';
 import {
@@ -7,9 +7,6 @@ import {
   evidenceSnapshots,
   matches,
   predictionLedger,
-  seasons,
-  teamRatings,
-  teams,
 } from '../../db/schema.ts';
 import { IdentityResolver } from '../../data/identity/resolver.ts';
 import { PredictionEngine } from '../../models/engine.ts';
@@ -19,6 +16,7 @@ import { WalkForwardBacktester } from '../../backtesting/walkForwardValidator.ts
 import { MonteCarloSimulator } from '../../simulation/monteCarlo.ts';
 import { UpcomingEngine } from '../../data/upcoming/upcomingEngine.ts';
 import { ProbabilityTrendEngine } from '../../data/upcoming/trendEngine.ts';
+import { requireAdminOrService } from '../../middleware/auth.ts';
 
 export const predictRouter = Router();
 
@@ -91,7 +89,6 @@ predictRouter.post('/', async (req: Request, res: Response) => {
       awayContext,
     } = parseResult.data;
 
-    // A: If fixtureId or matchId is supplied, use UpcomingEngine to generate validated prediction
     const targetMatchId = fixtureId || matchId;
     if (targetMatchId) {
       const parsedId = typeof targetMatchId === 'string' ? parseInt(targetMatchId, 10) : targetMatchId;
@@ -113,7 +110,6 @@ predictRouter.post('/', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Either fixtureId/matchId or both homeTeam and awayTeam must be provided.' });
     }
 
-    // 1. Resolve canonical team identities
     const resolvedHome = await IdentityResolver.resolveTeam(homeTeam);
     const resolvedAway = await IdentityResolver.resolveTeam(awayTeam);
 
@@ -124,7 +120,6 @@ predictRouter.post('/', async (req: Request, res: Response) => {
       });
     }
 
-    // 2. Resolve competition
     let [comp] = await db
       .select()
       .from(competitions)
@@ -141,58 +136,55 @@ predictRouter.post('/', async (req: Request, res: Response) => {
 
     const kickoffDate = kickoff ? new Date(kickoff) : new Date(Date.now() + 24 * 60 * 60 * 1000);
 
-    // 3. Query historical team ratings & Elo
-    const [homeRating] = await db
-      .select()
-      .from(teamRatings)
-      .where(eq(teamRatings.teamId, resolvedHome.id))
-      .orderBy(desc(teamRatings.ratingTimestamp))
-      .limit(1);
-
-    const [awayRating] = await db
-      .select()
-      .from(teamRatings)
-      .where(eq(teamRatings.teamId, resolvedAway.id))
-      .orderBy(desc(teamRatings.ratingTimestamp))
-      .limit(1);
-
-    const homeElo = homeRating?.overallElo ?? 1560;
-    const awayElo = awayRating?.overallElo ?? 1520;
-    const homeAttack = homeRating?.attackRating ?? 105;
-    const awayAttack = awayRating?.attackRating ?? 98;
-    const homeDefense = homeRating?.defenseRating ?? 102;
-    const awayDefense = awayRating?.defenseRating ?? 96;
-
-    // 4. Query Historical Evidence: H2H & Form
-    const [h2hSummary, homeForm, awayForm, webNews] = await Promise.all([
-      HistoricalEvidenceEngine.getH2HRecord(resolvedHome.id, resolvedAway.id),
-      HistoricalEvidenceEngine.getTeamForm(resolvedHome.id, true),
-      HistoricalEvidenceEngine.getTeamForm(resolvedAway.id, false),
-      WebIntelligenceEngine.gatherPreMatchIntelligence(resolvedHome.canonicalName, resolvedAway.canonicalName, kickoffDate),
+    const [homeRating, awayRating, h2hSummary, homeForm, awayForm, webNews] = await Promise.all([
+      HistoricalEvidenceEngine.getEffectiveTeamRating(resolvedHome.id, kickoffDate),
+      HistoricalEvidenceEngine.getEffectiveTeamRating(resolvedAway.id, kickoffDate),
+      HistoricalEvidenceEngine.getH2HRecord(resolvedHome.id, resolvedAway.id, kickoffDate),
+      HistoricalEvidenceEngine.getTeamForm(resolvedHome.id, true, kickoffDate),
+      HistoricalEvidenceEngine.getTeamForm(resolvedAway.id, false, kickoffDate),
+      WebIntelligenceEngine.gatherPreMatchIntelligence(
+        resolvedHome.canonicalName,
+        resolvedAway.canonicalName,
+        kickoffDate,
+        comp?.code
+      ),
     ]);
 
-    // 5. Run Complete Prediction Engine (Elo + Poisson + Dixon-Coles + Monte Carlo + Ensemble)
     const predictionResult = PredictionEngine.calculatePrediction({
       homeTeam: resolvedHome.canonicalName,
       awayTeam: resolvedAway.canonicalName,
       competition: comp ? comp.name : competitionName,
       venue: resolvedHome.venueName || 'Home Stadium',
       kickoffTime: kickoffDate,
-      homeElo,
-      awayElo,
-      homeAttack,
-      awayAttack,
-      homeDefense,
-      awayDefense,
-      sampleMatchesCount: homeForm.sampleMatches + awayForm.sampleMatches,
-      absences,
+      homeElo: homeRating.overallElo,
+      awayElo: awayRating.overallElo,
+      homeAttack: homeRating.attackRating,
+      awayAttack: awayRating.attackRating,
+      homeDefense: homeRating.defenseRating,
+      awayDefense: awayRating.defenseRating,
+      sampleMatchesCount: homeForm.sampleMatches + awayForm.sampleMatches + h2hSummary.totalH2HMatches,
+      absences:
+        absences && absences.length > 0
+          ? absences
+          : webNews.verifiedAbsences.map((a) => ({
+              name: a.playerName,
+              role: a.impactScore >= 0.2 ? ('PRIMARY_GOALSCORER' as const) : ('PRIMARY_PLAYMAKER' as const),
+              team:
+                a.team.toLowerCase() === resolvedHome.canonicalName.toLowerCase()
+                  ? ('HOME' as const)
+                  : ('AWAY' as const),
+              status: a.confirmed ? ('CONFIRMED_OUT' as const) : ('DOUBTFUL_75' as const),
+            })),
       marketOdds,
       homeContext,
       awayContext,
+      hasTeamRatings: !homeRating.isBaselineDefault || !awayRating.isBaselineDefault,
+      hasWebIntelligence: webNews.retrievalStatus !== 'UNAVAILABLE',
+      webIntelligenceReliability: webNews.overallIntelligenceReliability,
     });
 
-    // 6. Find or Create match record in DB
-    let [matchRecord] = await db
+    // Only link & persist snapshot/ledger if a genuine scheduled fixture already exists in PostgreSQL
+    const [existingMatch] = await db
       .select()
       .from(matches)
       .where(
@@ -204,36 +196,26 @@ predictRouter.post('/', async (req: Request, res: Response) => {
       )
       .limit(1);
 
-    if (!matchRecord) {
-      const [season] = await db
-        .select()
-        .from(seasons)
-        .where(eq(seasons.competitionId, comp ? comp.id : 1))
-        .limit(1);
-
-      const [insertedMatch] = await db
-        .insert(matches)
-        .values({
-          providerSource: 'prediction-engine',
-          externalId: `pred_${resolvedHome.id}_${resolvedAway.id}_${Date.now()}`,
-          competitionId: comp ? comp.id : 1,
-          seasonId: season ? season.id : 1,
-          round: 'Upcoming Fixture',
-          kickoffTime: kickoffDate,
-          homeTeamId: resolvedHome.id,
-          awayTeamId: resolvedAway.id,
-          venue: resolvedHome.venueName || 'Home Stadium',
-          status: 'SCHEDULED',
-        })
-        .returning();
-      matchRecord = insertedMatch;
+    if (!existingMatch) {
+      return res.json({
+        matchId: null,
+        snapshotId: null,
+        isAdHocMatchup: true,
+        ...predictionResult,
+        evidenceHierarchy: {
+          h2h: h2hSummary,
+          homeForm,
+          awayForm,
+          webIntelligence: webNews,
+        },
+        probabilityTrend: null,
+      });
     }
 
-    // 7. Create Pre-Match Immutable Evidence Snapshot
     const [snapshot] = await db
       .insert(evidenceSnapshots)
       .values({
-        matchId: matchRecord.id,
+        matchId: existingMatch.id,
         snapshotTimestamp: new Date(),
         h2hData: {
           directH2HFound: h2hSummary.directH2HFound,
@@ -253,15 +235,15 @@ predictRouter.post('/', async (req: Request, res: Response) => {
         webIntelligenceData: webNews,
         sourceReliabilityScore: webNews.overallIntelligenceReliability,
         dataQualityScore: predictionResult.dataQuality.score,
+        missingFields: predictionResult.dataQuality.missingInputs || [],
         isImmutable: true,
       })
       .returning();
 
-    // 8. Record in Prediction Ledger (Locked before kickoff)
     await db
       .insert(predictionLedger)
       .values({
-        matchId: matchRecord.id,
+        matchId: existingMatch.id,
         snapshotId: snapshot.id,
         predictionTimestamp: new Date(),
         kickoffTime: kickoffDate,
@@ -282,11 +264,12 @@ predictRouter.post('/', async (req: Request, res: Response) => {
       })
       .returning();
 
-    const trend = await ProbabilityTrendEngine.getTrendForMatch(matchRecord.id);
+    const trend = await ProbabilityTrendEngine.getTrendForMatch(existingMatch.id);
 
     res.json({
-      matchId: matchRecord.id,
+      matchId: existingMatch.id,
       snapshotId: snapshot.id,
+      isAdHocMatchup: false,
       ...predictionResult,
       evidenceHierarchy: {
         h2h: h2hSummary,
@@ -315,7 +298,7 @@ predictRouter.post('/backtest', async (req: Request, res: Response) => {
 });
 
 // POST /api/predict/audit
-predictRouter.post('/audit', async (_req: Request, res: Response) => {
+predictRouter.post('/audit', requireAdminOrService, async (_req: Request, res: Response) => {
   try {
     const auditResult = await WalkForwardBacktester.auditPredictionLedger();
     res.json({
@@ -337,20 +320,45 @@ predictRouter.get('/simulation/:matchId', async (req: Request, res: Response) =>
     const [match] = await db.select().from(matches).where(eq(matches.id, matchId)).limit(1);
     if (!match) return res.status(404).json({ error: 'Match not found' });
 
-    const sim = MonteCarloSimulator.simulateMatch({
-      simulationsCount: 10000,
-      homeLambda: 1.65,
-      awayMu: 1.10,
+    const cutoff = new Date(match.kickoffTime);
+    const [homeRating, awayRating] = await Promise.all([
+      HistoricalEvidenceEngine.getEffectiveTeamRating(match.homeTeamId, cutoff),
+      HistoricalEvidenceEngine.getEffectiveTeamRating(match.awayTeamId, cutoff),
+    ]);
+
+    const prediction = PredictionEngine.calculatePrediction({
+      homeTeam: String(match.homeTeamId),
+      awayTeam: String(match.awayTeamId),
+      competition: 'Match Simulation',
+      kickoffTime: cutoff,
+      homeElo: homeRating.overallElo,
+      awayElo: awayRating.overallElo,
+      homeAttack: homeRating.attackRating,
+      awayAttack: awayRating.attackRating,
+      homeDefense: homeRating.defenseRating,
+      awayDefense: awayRating.defenseRating,
+      sampleMatchesCount: homeRating.matchesPlayed + awayRating.matchesPlayed,
+      hasTeamRatings: !homeRating.isBaselineDefault || !awayRating.isBaselineDefault,
     });
 
-    res.json({ matchId, ...sim });
+    const sim = MonteCarloSimulator.simulateMatch({
+      simulationsCount: 10000,
+      homeLambda: prediction.expectedGoals.home,
+      awayMu: prediction.expectedGoals.away,
+    });
+
+    res.json({
+      matchId,
+      homeLambda: prediction.expectedGoals.home,
+      awayMu: prediction.expectedGoals.away,
+      ...sim,
+    });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Simulation failed' });
   }
 });
 
 // GET /api/predict/trend/:matchId
-// Returns the chronological Ensemble Probability changes over time as data sources were ingested
 predictRouter.get('/trend/:matchId', async (req: Request, res: Response) => {
   try {
     const matchId = parseInt(req.params.matchId, 10);
@@ -367,8 +375,7 @@ predictRouter.get('/trend/:matchId', async (req: Request, res: Response) => {
 });
 
 // POST /api/predict/ingest-source
-// Ingests an updated data source on-demand (breaking absence, market odds shift, lineup confirmation)
-predictRouter.post('/ingest-source', async (req: Request, res: Response) => {
+predictRouter.post('/ingest-source', requireAdminOrService, async (req: Request, res: Response) => {
   try {
     const { matchId, sourceType, absencePlayer, absenceTeam, marketOddsHome, marketOddsDraw, marketOddsAway, notes } = req.body;
     const targetId = parseInt(matchId, 10);

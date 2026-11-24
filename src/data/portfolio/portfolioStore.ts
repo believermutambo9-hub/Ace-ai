@@ -1,4 +1,5 @@
-// Paper Trading & Bankroll Portfolio Store
+import { FirestorePortfolioSync } from './firestorePortfolioSync.ts';
+
 export interface BetSlipItem {
   id: string; // unique item id
   matchId: number;
@@ -44,56 +45,16 @@ export interface PortfolioState {
   trackedBets: TrackedBet[];
 }
 
-const STORAGE_KEY = 'kickprophet_portfolio_v1';
-const LISTEN_EVENT = 'kickprophet_portfolio_update';
+const STORAGE_KEY = 'pitchintel_portfolio_v1';
+const LEGACY_STORAGE_KEY = 'kickprophet_portfolio_v1';
+const LISTEN_EVENT = 'pitchintel_portfolio_update';
 
 function getDefaultState(): PortfolioState {
   return {
     bankroll: 1000.0,
     initialBankroll: 1000.0,
     slip: [],
-    trackedBets: [
-      {
-        id: 'sample-bet-1',
-        placedAt: new Date(Date.now() - 3600000 * 4).toISOString(),
-        matchId: 101,
-        homeTeam: 'Arsenal',
-        awayTeam: 'Chelsea',
-        competition: 'Premier League',
-        kickoffTime: new Date(Date.now() - 3600000 * 2).toISOString(),
-        marketType: '1X2',
-        selection: 'HOME',
-        selectionLabel: 'Arsenal to Win',
-        odds: 1.85,
-        stake: 50.0,
-        potentialPayout: 92.5,
-        modelProbability: 0.62,
-        edgePercent: 14.7,
-        status: 'WON',
-        settledAt: new Date(Date.now() - 3600000).toISOString(),
-        profit: 42.5,
-      },
-      {
-        id: 'sample-bet-2',
-        placedAt: new Date(Date.now() - 3600000 * 24).toISOString(),
-        matchId: 102,
-        homeTeam: 'Real Madrid',
-        awayTeam: 'Barcelona',
-        competition: 'La Liga',
-        kickoffTime: new Date(Date.now() - 3600000 * 20).toISOString(),
-        marketType: 'TOTAL_GOALS_2_5',
-        selection: 'OVER',
-        selectionLabel: 'Over 2.5 Goals',
-        odds: 1.72,
-        stake: 40.0,
-        potentialPayout: 68.8,
-        modelProbability: 0.65,
-        edgePercent: 11.8,
-        status: 'WON',
-        settledAt: new Date(Date.now() - 3600000 * 18).toISOString(),
-        profit: 28.8,
-      },
-    ],
+    trackedBets: [],
   };
 }
 
@@ -101,7 +62,10 @@ export class PortfolioStore {
   public static getState(): PortfolioState {
     if (typeof window === 'undefined') return getDefaultState();
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      let raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) {
+        raw = localStorage.getItem(LEGACY_STORAGE_KEY);
+      }
       if (!raw) {
         const def = getDefaultState();
         localStorage.setItem(STORAGE_KEY, JSON.stringify(def));
@@ -183,12 +147,14 @@ export class PortfolioStore {
     if (state.slip.length === 0) return 0;
 
     let placedCount = 0;
+    const newlyPlaced: TrackedBet[] = [];
+
     for (const item of state.slip) {
       if (state.bankroll < item.stake) continue;
 
       state.bankroll -= item.stake;
-      state.trackedBets.unshift({
-        id: `bet-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
+      const newBet: TrackedBet = {
+        id: `bet-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         placedAt: new Date().toISOString(),
         matchId: item.matchId,
         homeTeam: item.homeTeam,
@@ -204,12 +170,21 @@ export class PortfolioStore {
         modelProbability: item.modelProbability,
         edgePercent: item.edgePercent,
         status: 'OPEN',
-      });
+      };
+      state.trackedBets.unshift(newBet);
+      newlyPlaced.push(newBet);
       placedCount++;
     }
 
     state.slip = [];
     this.saveState(state);
+
+    for (const bet of newlyPlaced) {
+      FirestorePortfolioSync.syncBetToFirestore(bet).catch((err) => {
+        console.warn('Firestore bet sync notice:', err);
+      });
+    }
+
     return placedCount;
   }
 
@@ -234,11 +209,40 @@ export class PortfolioStore {
 
     state.bankroll = Math.round(state.bankroll * 100) / 100;
     this.saveState(state);
+
+    FirestorePortfolioSync.updateSettledBetInFirestore(
+      betId,
+      outcome,
+      bet.profit ?? 0,
+      bet.settledAt
+    ).catch((err) => {
+      console.warn('Firestore bet settlement sync notice:', err);
+    });
   }
 
   public static deleteTrackedBet(betId: string): void {
     const state = this.getState();
     state.trackedBets = state.trackedBets.filter(b => b.id !== betId);
+    this.saveState(state);
+
+    FirestorePortfolioSync.deleteBetFromFirestore(betId).catch((err) => {
+      console.warn('Firestore bet delete sync notice:', err);
+    });
+  }
+
+  public static mergeCloudBets(cloudBets: TrackedBet[]): void {
+    if (!cloudBets || cloudBets.length === 0) return;
+    const state = this.getState();
+    const byId = new Map<string, TrackedBet>();
+    for (const b of state.trackedBets) {
+      byId.set(b.id, b);
+    }
+    for (const cb of cloudBets) {
+      byId.set(cb.id, cb);
+    }
+    state.trackedBets = Array.from(byId.values()).sort(
+      (a, b) => new Date(b.placedAt).getTime() - new Date(a.placedAt).getTime()
+    );
     this.saveState(state);
   }
 

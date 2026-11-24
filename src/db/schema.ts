@@ -25,17 +25,45 @@ export const users = pgTable('users', {
 export const usersRelations = relations(users, () => ({}));
 
 // ---------------------------------------------------------
-// 2. Competitions Table (Leagues & International Tournaments)
+// 2. Countries & Regions Table
+// ---------------------------------------------------------
+export const countries = pgTable(
+  'countries',
+  {
+    id: serial('id').primaryKey(),
+    code: text('code').notNull().unique(), // e.g. 'ENG', 'ESP', 'ITA', 'DEU', 'FRA', 'NLD', 'PRT', 'USA', 'BRA', 'ARG', 'ZAM', 'WORLD'
+    name: text('name').notNull(),
+    region: text('region'), // e.g. 'Europe', 'South America', 'North America', 'Africa', 'Asia', 'Worldwide'
+    flag: text('flag'),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    codeIdx: uniqueIndex('countries_code_idx').on(table.code),
+  })
+);
+
+export const countriesRelations = relations(countries, ({ many }) => ({
+  competitions: many(competitions),
+}));
+
+// ---------------------------------------------------------
+// 3. Competitions Table (Leagues & International Tournaments)
 // ---------------------------------------------------------
 export const competitions = pgTable(
   'competitions',
   {
     id: serial('id').primaryKey(),
-    code: text('code').notNull().unique(), // e.g. 'PL', 'CL', 'PD', 'SA', 'BL1'
+    code: text('code').notNull().unique(), // e.g. 'PL', 'CL', 'PD', 'SA', 'BL1', 'MLS', 'BSA', 'ARG'
     name: text('name').notNull(),
     country: text('country').notNull(),
+    countryCode: text('country_code'),
+    externalId: text('external_id'),
+    providerSource: text('provider_source'),
     tier: integer('tier').default(1),
     type: text('type').default('LEAGUE').notNull(), // 'LEAGUE' | 'CUP' | 'INTERNATIONAL'
+    isDomesticCup: boolean('is_domestic_cup').default(false),
+    gender: text('gender').default('MALE'),
+    format: text('format').default('DOMESTIC_LEAGUE'),
     emblem: text('emblem'),
     createdAt: timestamp('created_at').defaultNow(),
   },
@@ -46,7 +74,7 @@ export const competitions = pgTable(
 );
 
 // ---------------------------------------------------------
-// 3. Teams Table (Canonical entity for football clubs)
+// 4. Teams Table (Canonical entity for football clubs)
 // ---------------------------------------------------------
 export const teams = pgTable(
   'teams',
@@ -68,7 +96,7 @@ export const teams = pgTable(
 );
 
 // ---------------------------------------------------------
-// 4. Team Aliases Table (Identity Resolution)
+// 5. Team Aliases Table (Identity Resolution)
 // ---------------------------------------------------------
 export const teamAliases = pgTable(
   'team_aliases',
@@ -88,7 +116,7 @@ export const teamAliases = pgTable(
 );
 
 // ---------------------------------------------------------
-// 5. Seasons Table
+// 6. Seasons Table
 // ---------------------------------------------------------
 export const seasons = pgTable(
   'seasons',
@@ -100,6 +128,10 @@ export const seasons = pgTable(
     seasonCode: text('season_code').notNull(), // e.g. '2024-2025' or '2026'
     yearStart: integer('year_start').notNull(),
     yearEnd: integer('year_end').notNull(),
+    startDate: timestamp('start_date', { withTimezone: true }),
+    endDate: timestamp('end_date', { withTimezone: true }),
+    matchesCount: integer('matches_count').default(0),
+    status: text('status').default('COMPLETED'), // 'COMPLETED' | 'IN_PROGRESS' | 'SCHEDULED'
     isCurrent: boolean('is_current').default(false).notNull(),
   },
   (table) => ({
@@ -108,7 +140,7 @@ export const seasons = pgTable(
 );
 
 // ---------------------------------------------------------
-// 6. Matches Table
+// 7. Matches Table
 // ---------------------------------------------------------
 export const matches = pgTable(
   'matches',
@@ -133,12 +165,20 @@ export const matches = pgTable(
       .notNull(),
     venue: text('venue'),
     referee: text('referee'),
-    status: text('status').default('SCHEDULED').notNull(), // 'SCHEDULED' | 'LIVE' | 'FINISHED' | 'POSTPONED'
+    attendance: integer('attendance'),
+    status: text('status').default('SCHEDULED').notNull(), // 'SCHEDULED' | 'LIVE' | 'FINISHED' | 'POSTPONED' | 'CANCELLED'
     homeScoreHalfTime: integer('home_score_half_time'),
     awayScoreHalfTime: integer('away_score_half_time'),
     homeScoreFullTime: integer('home_score_full_time'),
     awayScoreFullTime: integer('away_score_full_time'),
+    homeScoreExtraTime: integer('home_score_extra_time'),
+    awayScoreExtraTime: integer('away_score_extra_time'),
+    homeScorePenalties: integer('home_score_penalties'),
+    awayScorePenalties: integer('away_score_penalties'),
     result: text('result'), // 'HOME_WIN' | 'DRAW' | 'AWAY_WIN'
+    dataCompleteness: text('data_completeness').default('SCORES'), // 'BASIC' | 'SCORES' | 'DETAILED_STATS' | 'ODDS' | 'LINEUPS'
+    secondaryProviderId: text('secondary_provider_id'),
+    secondaryProviderSource: text('secondary_provider_source'),
     metadata: jsonb('metadata'),
     createdAt: timestamp('created_at').defaultNow(),
     updatedAt: timestamp('updated_at').defaultNow(),
@@ -157,7 +197,7 @@ export const matches = pgTable(
 );
 
 // ---------------------------------------------------------
-// 7. Match Statistics Table (Detailed match facts)
+// 8. Match Statistics Table (Detailed match facts)
 // ---------------------------------------------------------
 export const matchStatistics = pgTable(
   'match_statistics',
@@ -178,8 +218,12 @@ export const matchStatistics = pgTable(
     yellowCards: integer('yellow_cards'),
     redCards: integer('red_cards'),
     offsides: integer('offsides'),
+    saves: integer('saves'),
+    passes: integer('passes'),
+    passAccuracy: integer('pass_accuracy'),
     xg: doublePrecision('xg'),
     xga: doublePrecision('xga'),
+    expectedAssists: doublePrecision('expected_assists'),
     createdAt: timestamp('created_at').defaultNow(),
   },
   (table) => ({
@@ -188,7 +232,97 @@ export const matchStatistics = pgTable(
 );
 
 // ---------------------------------------------------------
-// 8. Dynamic Team Ratings (Elo / Glicko / Strengths)
+// 9. Historical Odds Table
+// ---------------------------------------------------------
+export const historicalOdds = pgTable(
+  'historical_odds',
+  {
+    id: serial('id').primaryKey(),
+    matchId: integer('match_id')
+      .references(() => matches.id, { onDelete: 'cascade' })
+      .notNull(),
+    providerSource: text('provider_source').notNull(),
+    bookmaker: text('bookmaker').notNull(),
+    marketType: text('market_type').notNull(), // 'MATCH_WINNER' | 'OVER_UNDER_25' | 'BTTS' | 'ASIAN_HANDICAP'
+    selection: text('selection').notNull(), // 'HOME' | 'DRAW' | 'AWAY' | 'OVER' | 'UNDER' | 'YES' | 'NO'
+    decimalOdds: doublePrecision('decimal_odds').notNull(),
+    quoteTimestamp: timestamp('quote_timestamp', { withTimezone: true }).notNull(),
+    isOpening: boolean('is_opening').default(false),
+    isClosing: boolean('is_closing').default(false),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    matchIdx: index('historical_odds_match_idx').on(table.matchId),
+    marketIdx: index('historical_odds_market_idx').on(table.matchId, table.marketType),
+  })
+);
+
+// ---------------------------------------------------------
+// 10. Lineups Table
+// ---------------------------------------------------------
+export const lineups = pgTable(
+  'lineups',
+  {
+    id: serial('id').primaryKey(),
+    matchId: integer('match_id')
+      .references(() => matches.id, { onDelete: 'cascade' })
+      .notNull(),
+    teamId: integer('team_id')
+      .references(() => teams.id, { onDelete: 'cascade' })
+      .notNull(),
+    isHome: boolean('is_home').notNull(),
+    formation: text('formation'),
+    confirmed: boolean('confirmed').default(true),
+    coach: text('coach'),
+    startingEleven: jsonb('starting_eleven'),
+    substitutes: jsonb('substitutes'),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    matchTeamIdx: uniqueIndex('lineups_match_team_idx').on(table.matchId, table.teamId),
+  })
+);
+
+// ---------------------------------------------------------
+// 11. Standings Table
+// ---------------------------------------------------------
+export const standings = pgTable(
+  'standings',
+  {
+    id: serial('id').primaryKey(),
+    competitionId: integer('competition_id')
+      .references(() => competitions.id, { onDelete: 'cascade' })
+      .notNull(),
+    seasonId: integer('season_id')
+      .references(() => seasons.id, { onDelete: 'cascade' })
+      .notNull(),
+    teamId: integer('team_id')
+      .references(() => teams.id, { onDelete: 'cascade' })
+      .notNull(),
+    position: integer('position').notNull(),
+    played: integer('played').notNull(),
+    won: integer('won').notNull(),
+    drawn: integer('drawn').notNull(),
+    lost: integer('lost').notNull(),
+    goalsFor: integer('goals_for').notNull(),
+    goalsAgainst: integer('goals_against').notNull(),
+    goalDifference: integer('goal_difference').notNull(),
+    points: integer('points').notNull(),
+    form: text('form'),
+    createdAt: timestamp('created_at').defaultNow(),
+    updatedAt: timestamp('updated_at').defaultNow(),
+  },
+  (table) => ({
+    compSeasonTeamIdx: uniqueIndex('standings_comp_season_team_idx').on(
+      table.competitionId,
+      table.seasonId,
+      table.teamId
+    ),
+  })
+);
+
+// ---------------------------------------------------------
+// 12. Dynamic Team Ratings (Elo / Glicko / Strengths)
 // ---------------------------------------------------------
 export const teamRatings = pgTable(
   'team_ratings',
@@ -215,7 +349,7 @@ export const teamRatings = pgTable(
 );
 
 // ---------------------------------------------------------
-// 9. Pre-Match Evidence Snapshots (Immutable Pre-Kickoff)
+// 13. Pre-Match Evidence Snapshots (Immutable Pre-Kickoff)
 // ---------------------------------------------------------
 export const evidenceSnapshots = pgTable(
   'evidence_snapshots',
@@ -240,7 +374,7 @@ export const evidenceSnapshots = pgTable(
 );
 
 // ---------------------------------------------------------
-// 10. Prediction Ledger (Pre-Kickoff Locked Ledger)
+// 14. Prediction Ledger (Pre-Kickoff Locked Ledger)
 // ---------------------------------------------------------
 export const predictionLedger = pgTable(
   'prediction_ledger',
@@ -282,7 +416,7 @@ export const predictionLedger = pgTable(
 );
 
 // ---------------------------------------------------------
-// 11. Ingestion Logs (Auditing & Discrepancy Tracking)
+// 15. Ingestion Logs (Auditing & Discrepancy Tracking)
 // ---------------------------------------------------------
 export const ingestionLogs = pgTable(
   'ingestion_logs',
@@ -305,11 +439,82 @@ export const ingestionLogs = pgTable(
 );
 
 // ---------------------------------------------------------
+// 16. Resumable Backfill Jobs Table
+// ---------------------------------------------------------
+export const backfillJobs = pgTable(
+  'backfill_jobs',
+  {
+    id: serial('id').primaryKey(),
+    jobType: text('job_type').notNull(), // 'HISTORICAL_BACKFILL' | 'SEASON_IMPORT' | 'DELTA_SYNC' | 'DRY_RUN'
+    providerSource: text('provider_source').notNull(), // 'open-football' | 'football-data-org' | 'api-football-v3' | 'all'
+    competitionCode: text('competition_code'),
+    seasonCode: text('season_code'),
+    status: text('status').default('PENDING').notNull(), // 'PENDING' | 'RUNNING' | 'PAUSED' | 'COMPLETED' | 'FAILED' | 'CANCELLED'
+    totalDiscovered: integer('total_discovered').default(0),
+    processedCount: integer('processed_count').default(0),
+    insertedCount: integer('inserted_count').default(0),
+    updatedCount: integer('updated_count').default(0),
+    failedCount: integer('failed_count').default(0),
+    currentCursor: text('current_cursor'),
+    checkpointData: jsonb('checkpoint_data'),
+    startedAt: timestamp('started_at', { withTimezone: true }),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+    lastHeartbeatAt: timestamp('last_heartbeat_at', { withTimezone: true }),
+    errorLog: jsonb('error_log'),
+    retryCount: integer('retry_count').default(0),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    statusIdx: index('backfill_jobs_status_idx').on(table.status),
+  })
+);
+
+// ---------------------------------------------------------
+// 17. Worldwide Coverage Inventory Table
+// ---------------------------------------------------------
+export const coverageInventory = pgTable(
+  'coverage_inventory',
+  {
+    id: serial('id').primaryKey(),
+    providerSource: text('provider_source').notNull(),
+    country: text('country').notNull(),
+    competitionCode: text('competition_code').notNull(),
+    competitionName: text('competition_name').notNull(),
+    competitionType: text('competition_type').notNull(),
+    seasonCode: text('season_code').notNull(),
+    earliestMatchDate: timestamp('earliest_match_date', { withTimezone: true }),
+    latestMatchDate: timestamp('latest_match_date', { withTimezone: true }),
+    matchesDiscovered: integer('matches_discovered').default(0),
+    matchesImported: integer('matches_imported').default(0),
+    matchesMissing: integer('matches_missing').default(0),
+    hasScores: boolean('has_scores').default(true),
+    hasStats: boolean('has_stats').default(false),
+    hasXg: boolean('has_xg').default(false),
+    hasOdds: boolean('has_odds').default(false),
+    hasLineups: boolean('has_lineups').default(false),
+    accessRestrictions: text('access_restrictions').default('NONE'),
+    lastSyncAt: timestamp('last_sync_at', { withTimezone: true }),
+    syncStatus: text('sync_status').default('VERIFIED'),
+    syncErrorMessage: text('sync_error_message'),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => ({
+    uniqueInventoryIdx: uniqueIndex('coverage_inventory_unique_idx').on(
+      table.providerSource,
+      table.competitionCode,
+      table.seasonCode
+    ),
+    countryIdx: index('coverage_inventory_country_idx').on(table.country),
+  })
+);
+
+// ---------------------------------------------------------
 // Relationships Definition
 // ---------------------------------------------------------
 export const competitionsRelations = relations(competitions, ({ many }) => ({
   seasons: many(seasons),
   matches: many(matches),
+  standings: many(standings),
 }));
 
 export const teamsRelations = relations(teams, ({ many }) => ({
@@ -317,6 +522,8 @@ export const teamsRelations = relations(teams, ({ many }) => ({
   homeMatches: many(matches, { relationName: 'homeMatches' }),
   awayMatches: many(matches, { relationName: 'awayMatches' }),
   ratings: many(teamRatings),
+  standings: many(standings),
+  lineups: many(lineups),
 }));
 
 export const teamAliasesRelations = relations(teamAliases, ({ one }) => ({
@@ -332,6 +539,7 @@ export const seasonsRelations = relations(seasons, ({ one, many }) => ({
     references: [competitions.id],
   }),
   matches: many(matches),
+  standings: many(standings),
 }));
 
 export const matchesRelations = relations(matches, ({ one, many }) => ({
@@ -354,6 +562,8 @@ export const matchesRelations = relations(matches, ({ one, many }) => ({
     relationName: 'awayMatches',
   }),
   statistics: many(matchStatistics),
+  historicalOdds: many(historicalOdds),
+  lineups: many(lineups),
   evidenceSnapshots: many(evidenceSnapshots),
   predictions: many(predictionLedger),
 }));
@@ -365,6 +575,39 @@ export const matchStatisticsRelations = relations(matchStatistics, ({ one }) => 
   }),
   team: one(teams, {
     fields: [matchStatistics.teamId],
+    references: [teams.id],
+  }),
+}));
+
+export const historicalOddsRelations = relations(historicalOdds, ({ one }) => ({
+  match: one(matches, {
+    fields: [historicalOdds.matchId],
+    references: [matches.id],
+  }),
+}));
+
+export const lineupsRelations = relations(lineups, ({ one }) => ({
+  match: one(matches, {
+    fields: [lineups.matchId],
+    references: [matches.id],
+  }),
+  team: one(teams, {
+    fields: [lineups.teamId],
+    references: [teams.id],
+  }),
+}));
+
+export const standingsRelations = relations(standings, ({ one }) => ({
+  competition: one(competitions, {
+    fields: [standings.competitionId],
+    references: [competitions.id],
+  }),
+  season: one(seasons, {
+    fields: [standings.seasonId],
+    references: [seasons.id],
+  }),
+  team: one(teams, {
+    fields: [standings.teamId],
     references: [teams.id],
   }),
 }));

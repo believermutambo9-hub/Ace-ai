@@ -64,7 +64,7 @@ export const PWAInstallButton: React.FC = () => {
                 </div>
                 <div className="flex items-start gap-2.5">
                   <span className="flex items-center justify-center w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-400 font-mono text-[10px] shrink-0 font-bold">3</span>
-                  <span>Launch KickProphet full-screen anytime directly from your home screen.</span>
+                  <span>Launch PitchIntel full-screen anytime directly from your home screen.</span>
                 </div>
               </div>
               <button

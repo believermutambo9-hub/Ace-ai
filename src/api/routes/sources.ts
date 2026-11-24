@@ -5,7 +5,10 @@ import { ingestionLogs } from '../../db/schema.ts';
 import { OpenFootballProvider } from '../../data/providers/openFootballProvider.ts';
 import { ApiFootballProvider } from '../../data/providers/apiFootballProvider.ts';
 import { FootballDataProvider } from '../../data/providers/footballDataProvider.ts';
+import { LiveWebFeedProvider } from '../../data/providers/liveWebFeedProvider.ts';
+import { NewsEngine } from '../../data/news/newsEngine.ts';
 import { SyncManager } from '../../data/ingestion/syncManager.ts';
+import { zedAuthMiddleware } from '../../middleware/zedAuth.ts';
 
 export const sourcesRouter = Router();
 
@@ -15,11 +18,14 @@ sourcesRouter.get('/', async (_req: Request, res: Response) => {
     const openProvider = new OpenFootballProvider();
     const apiFootballProvider = new ApiFootballProvider();
     const footballDataProvider = new FootballDataProvider();
+    const liveWebFeedProvider = new LiveWebFeedProvider();
 
-    const [openHealth, apiFootballHealth, footballDataHealth] = await Promise.all([
+    const [openHealth, apiFootballHealth, footballDataHealth, liveWebHealth, newsHealth] = await Promise.all([
       openProvider.checkHealth(),
       apiFootballProvider.checkHealth(),
       footballDataProvider.checkHealth(),
+      liveWebFeedProvider.checkHealth(),
+      NewsEngine.checkHealth(),
     ]);
 
     const recentLogs = await db
@@ -29,25 +35,42 @@ sourcesRouter.get('/', async (_req: Request, res: Response) => {
       .limit(20);
 
     res.json({
-      activePrimary: footballDataHealth.isOnline ? 'football-data-org' : (apiFootballHealth.isOnline ? 'api-football-v3' : 'open-football'),
+      activePrimary: footballDataHealth.isOnline
+        ? 'football-data-org'
+        : liveWebHealth.isOnline
+        ? 'live-web-feed'
+        : apiFootballHealth.isOnline
+        ? 'api-football-v3'
+        : 'open-football',
       providers: [
         {
           id: 'football-data-org',
           name: 'Football-Data.org (API v4 Direct)',
           tier: 'PRIMARY_ACTIVE',
           coverage: '13 Major Global Competitions (PL, CL, BL1, SA, PD, FL1, etc.)',
-          status: footballDataHealth.isOnline ? 'OPERATIONAL' : 'STANDBY',
+          status: footballDataHealth.isOnline ? 'OPERATIONAL' : 'OFFLINE',
           latencyMs: footballDataHealth.latencyMs,
           lastChecked: footballDataHealth.lastChecked,
           message: footballDataHealth.message,
           authenticated: Boolean(process.env.FOOTBALL_DATA_API_KEY),
         },
         {
+          id: 'live-web-feed',
+          name: 'Global Live Web Scoreboard Feed',
+          tier: 'PRIMARY_LIVE_WEB',
+          coverage: '20+ Live Global Leagues, In-Play Clocks, Events & Team Stats (Key-Free)',
+          status: liveWebHealth.isOnline ? 'OPERATIONAL' : 'OFFLINE',
+          latencyMs: liveWebHealth.latencyMs,
+          lastChecked: liveWebHealth.lastChecked,
+          message: liveWebHealth.message,
+          authenticated: true,
+        },
+        {
           id: 'api-football-v3',
           name: 'API-Sports (API-Football v3 Direct)',
           tier: 'SECONDARY_LIVE',
           coverage: 'Worldwide Multi-Tier Leagues (Direct api-sports.io)',
-          status: apiFootballHealth.isOnline ? 'OPERATIONAL' : 'STANDBY',
+          status: apiFootballHealth.isOnline ? 'OPERATIONAL' : 'OFFLINE',
           latencyMs: apiFootballHealth.latencyMs,
           lastChecked: apiFootballHealth.lastChecked,
           message: apiFootballHealth.message,
@@ -58,7 +81,7 @@ sourcesRouter.get('/', async (_req: Request, res: Response) => {
           name: 'Open Football Data Pipeline (CDN)',
           tier: 'FALLBACK_REPOSITORY',
           coverage: 'Worldwide Historical & Schedule Feeds',
-          status: openHealth.isOnline ? 'OPERATIONAL' : 'DEGRADED',
+          status: openHealth.isOnline ? 'OPERATIONAL' : 'OFFLINE',
           latencyMs: openHealth.latencyMs,
           lastChecked: openHealth.lastChecked,
           message: openHealth.message,
@@ -66,11 +89,18 @@ sourcesRouter.get('/', async (_req: Request, res: Response) => {
         },
         {
           id: 'web-intelligence',
-          name: 'Verified Pre-Match Web Intelligence',
+          name: 'Live Football RSS, ESPN & Injury Feeds',
           tier: 'SUPPORTING_INTELLIGENCE',
-          coverage: 'Official Clubs, Leagues, and Tier 1 Press Releases',
-          status: 'OPERATIONAL',
-          lastChecked: new Date(),
+          coverage: 'BBC Sport, Sky Sports, The Guardian & ESPN Global Soccer',
+          status: newsHealth.status,
+          articlesCached: newsHealth.articlesCached,
+          activeSources: newsHealth.activeSources,
+          failedSources: newsHealth.failedSources,
+          lastChecked: new Date().toISOString(),
+          message:
+            newsHealth.activeSources.length > 0
+              ? `${newsHealth.activeSources.length} live news feeds operational (${newsHealth.articlesCached} articles)`
+              : 'All news feeds unreachable',
           authenticated: true,
         },
       ],
@@ -82,14 +112,16 @@ sourcesRouter.get('/', async (_req: Request, res: Response) => {
   }
 });
 
-// POST /api/data-sources/sync - Trigger sync with authenticated provider
-sourcesRouter.post('/sync', async (req: Request, res: Response) => {
+// POST /api/data-sources/sync - Trigger sync with authenticated provider (Protected)
+sourcesRouter.post('/sync', zedAuthMiddleware, async (req: Request, res: Response) => {
   try {
     const { provider = 'football-data', competitionCode = 'PL', seasonCode = '2024-2025' } = req.body || {};
 
     let selectedProvider;
     if (provider === 'football-data' || provider === 'football-data-org') {
       selectedProvider = new FootballDataProvider();
+    } else if (provider === 'live-web-feed') {
+      selectedProvider = new LiveWebFeedProvider();
     } else if (provider === 'api-football' || provider === 'api-football-v3') {
       selectedProvider = new ApiFootballProvider();
     } else {
@@ -113,8 +145,8 @@ sourcesRouter.post('/sync', async (req: Request, res: Response) => {
   }
 });
 
-// POST /api/data-sources/sync-all-history - Mass Ingestion of all historical matches across leagues and seasons
-sourcesRouter.post('/sync-all-history', async (_req: Request, res: Response) => {
+// POST /api/data-sources/sync-all-history - Mass Ingestion of all historical matches (Protected)
+sourcesRouter.post('/sync-all-history', zedAuthMiddleware, async (_req: Request, res: Response) => {
   try {
     const { ComprehensiveHistoryIngestion } = await import('../../data/ingestion/comprehensiveHistoryIngestion.ts');
     // Start asynchronous mass ingestion

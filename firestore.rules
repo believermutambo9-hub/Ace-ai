@@ -1,0 +1,189 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny all access
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Hardened Primitive Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isVerified() && request.auth.token.email == 'believermutambo9@gmail.com';
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Validation for UserProfile
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['uid', 'email', 'displayName', 'photoURL', 'createdAt', 'updatedAt']) &&
+             data.uid is string && data.uid.size() > 0 && data.uid.size() <= 128 &&
+             data.email is string && data.email.size() > 0 && data.email.size() <= 256 &&
+             (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 100)) &&
+             (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 500)) &&
+             data.createdAt is string && data.createdAt.size() <= 64 &&
+             data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    // Validation for UserBet
+    function isValidUserBet(data) {
+      return data.keys().hasAll(['id', 'userId', 'matchId', 'homeTeam', 'awayTeam', 'competition', 'marketType', 'selection', 'odds', 'stake', 'status', 'placedAt']) &&
+             data.keys().hasOnly(['id', 'userId', 'matchId', 'homeTeam', 'awayTeam', 'competition', 'marketType', 'selection', 'odds', 'stake', 'modelProbability', 'status', 'profit', 'placedAt', 'settledAt']) &&
+             data.id is string && data.id.size() > 0 && data.id.size() <= 64 &&
+             data.userId is string && data.userId.size() > 0 && data.userId.size() <= 128 &&
+             data.matchId is string && data.matchId.size() > 0 && data.matchId.size() <= 64 &&
+             data.homeTeam is string && data.homeTeam.size() > 0 && data.homeTeam.size() <= 128 &&
+             data.awayTeam is string && data.awayTeam.size() > 0 && data.awayTeam.size() <= 128 &&
+             data.competition is string && data.competition.size() > 0 && data.competition.size() <= 128 &&
+             data.marketType in ['MATCH_WINNER_HOME', 'MATCH_WINNER_DRAW', 'MATCH_WINNER_AWAY', 'OVER_25', 'UNDER_25', 'BTTS_YES', 'BTTS_NO'] &&
+             data.selection is string && data.selection.size() > 0 && data.selection.size() <= 64 &&
+             data.odds is number && data.odds >= 1.01 && data.odds <= 1000.0 &&
+             data.stake is number && data.stake > 0.0 && data.stake <= 1000000.0 &&
+             (!('modelProbability' in data) || (data.modelProbability is number && data.modelProbability >= 0.0 && data.modelProbability <= 1.0)) &&
+             data.status in ['OPEN', 'WON', 'LOST', 'VOID', 'PUSH'] &&
+             (!('profit' in data) || (data.profit is number)) &&
+             data.placedAt is string && data.placedAt.size() <= 64 &&
+             (!('settledAt' in data) || (data.settledAt is string && data.settledAt.size() <= 64));
+    }
+
+    // Validation for UserFavourite
+    function isValidUserFavourite(data) {
+      return data.keys().hasAll(['id', 'userId', 'entityType', 'entityId', 'name', 'createdAt']) &&
+             data.keys().hasOnly(['id', 'userId', 'entityType', 'entityId', 'name', 'createdAt']) &&
+             data.id is string && data.id.size() > 0 && data.id.size() <= 64 &&
+             data.userId is string && data.userId.size() > 0 && data.userId.size() <= 128 &&
+             data.entityType in ['TEAM', 'COMPETITION'] &&
+             data.entityId is string && data.entityId.size() > 0 && data.entityId.size() <= 64 &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 128 &&
+             data.createdAt is string && data.createdAt.size() <= 64;
+    }
+
+    // Validation for ErrorReport
+    function isValidErrorReport(data) {
+      return data.keys().hasAll(['id', 'userId', 'source', 'endpoint', 'method', 'statusCode', 'errorMessage', 'environment', 'status', 'createdAt']) &&
+             data.keys().hasOnly(['id', 'userId', 'source', 'endpoint', 'method', 'statusCode', 'errorMessage', 'stack', 'context', 'environment', 'status', 'createdAt', 'resolvedAt']) &&
+             data.id is string && data.id.size() > 0 && data.id.size() <= 64 && isValidId(data.id) &&
+             data.userId is string && data.userId.size() > 0 && data.userId.size() <= 128 &&
+             data.source is string && data.source.size() > 0 && data.source.size() <= 128 &&
+             data.endpoint is string && data.endpoint.size() > 0 && data.endpoint.size() <= 512 &&
+             data.method in ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'UI', 'OTHER'] &&
+             data.statusCode is number && data.statusCode >= 0 && data.statusCode <= 599 &&
+             data.errorMessage is string && data.errorMessage.size() > 0 && data.errorMessage.size() <= 1000 &&
+             (!('stack' in data) || (data.stack is string && data.stack.size() <= 2000)) &&
+             (!('context' in data) || (data.context is string && data.context.size() <= 1000)) &&
+             data.environment in ['browser', 'server'] &&
+             data.status in ['OPEN', 'ACKNOWLEDGED', 'RESOLVED'] &&
+             data.createdAt is string && data.createdAt.size() > 0 && data.createdAt.size() <= 64 &&
+             (!('resolvedAt' in data) || (data.resolvedAt is string && data.resolvedAt.size() <= 64));
+    }
+
+    // User Profile Document Path
+    match /users/{userId} {
+      allow get: if isOwner(userId) && isValidId(userId);
+      allow list: if false; // Blanket user listing forbidden
+
+      allow create: if isOwner(userId) &&
+                       isValidId(userId) &&
+                       incoming().uid == userId &&
+                       isValidUserProfile(incoming());
+
+      allow update: if isOwner(userId) &&
+                       isValidId(userId) &&
+                       incoming().uid == existing().uid &&
+                       incoming().createdAt == existing().createdAt &&
+                       isValidUserProfile(incoming());
+
+      allow delete: if isOwner(userId) && isValidId(userId);
+
+      // User Paper Trading Bets Subcollection
+      match /bets/{betId} {
+        allow get: if isOwner(userId) && isValidId(betId);
+        allow list: if isOwner(userId);
+
+        allow create: if isOwner(userId) &&
+                         isValidId(betId) &&
+                         incoming().userId == userId &&
+                         incoming().id == betId &&
+                         isValidUserBet(incoming());
+
+        allow update: if isOwner(userId) &&
+                         isValidId(betId) &&
+                         incoming().id == existing().id &&
+                         incoming().userId == existing().userId &&
+                         incoming().placedAt == existing().placedAt &&
+                         isValidUserBet(incoming());
+
+        allow delete: if isOwner(userId) && isValidId(betId);
+      }
+
+      // User Favourites Subcollection
+      match /favourites/{favouriteId} {
+        allow get: if isOwner(userId) && isValidId(favouriteId);
+        allow list: if isOwner(userId);
+
+        allow create: if isOwner(userId) &&
+                         isValidId(favouriteId) &&
+                         incoming().userId == userId &&
+                         incoming().id == favouriteId &&
+                         isValidUserFavourite(incoming());
+
+        allow update: if isOwner(userId) &&
+                         isValidId(favouriteId) &&
+                         incoming().id == existing().id &&
+                         incoming().userId == existing().userId &&
+                         incoming().createdAt == existing().createdAt &&
+                         isValidUserFavourite(incoming());
+
+        allow delete: if isOwner(userId) && isValidId(favouriteId);
+      }
+    }
+
+    // Data-layer API Error Monitoring Collection
+    match /error_reports/{reportId} {
+      allow get: if isSignedIn() && isValidId(reportId) && (resource.data.userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+
+      allow create: if isVerified() &&
+                       isValidId(reportId) &&
+                       isValidErrorReport(incoming()) &&
+                       incoming().id == reportId &&
+                       incoming().userId == request.auth.uid &&
+                       incoming().status == 'OPEN' &&
+                       !('resolvedAt' in incoming());
+
+      allow update: if isAdmin() &&
+                       isValidId(reportId) &&
+                       isValidErrorReport(incoming()) &&
+                       incoming().id == existing().id &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       existing().status != 'RESOLVED' &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['status', 'resolvedAt']);
+
+      allow delete: if isAdmin() && isValidId(reportId);
+    }
+  }
+}

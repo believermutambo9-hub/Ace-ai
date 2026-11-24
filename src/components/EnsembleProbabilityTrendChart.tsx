@@ -18,7 +18,9 @@ import {
   Eye,
   Filter,
 } from 'lucide-react';
-import { IngestionMilestone, MatchProbabilityTrend } from '../data/upcoming/trendEngine.ts';
+import type { IngestionMilestone, MatchProbabilityTrend } from '../types/football.ts';
+import { useAuth } from '../context/AuthContext.tsx';
+import { ErrorReportingService } from '../services/errorReporting.ts';
 
 interface EnsembleProbabilityTrendChartProps {
   trendData: MatchProbabilityTrend;
@@ -33,12 +35,16 @@ export function EnsembleProbabilityTrendChart({
   onRefreshTrend,
   compact = false,
 }: EnsembleProbabilityTrendChartProps) {
+  const { getIdToken } = useAuth();
   const [selectedMilestoneId, setSelectedMilestoneId] = useState<string | null>(null);
   const [outcomeFilter, setOutcomeFilter] = useState<'ALL' | 'HOME' | 'DRAW' | 'AWAY'>('ALL');
   const [metricMode, setMetricMode] = useState<'PROBABILITY' | 'ODDS' | 'XG'>('PROBABILITY');
   const [ingestingSource, setIngestingSource] = useState<boolean>(false);
   const [ingestNotice, setIngestNotice] = useState<string>('');
   const [customTrend, setCustomTrend] = useState<MatchProbabilityTrend | null>(null);
+  const [customOddsHome, setCustomOddsHome] = useState<string>('');
+  const [customOddsDraw, setCustomOddsDraw] = useState<string>('');
+  const [customOddsAway, setCustomOddsAway] = useState<string>('');
 
   const activeTrend = customTrend || trendData;
   const milestones = activeTrend.milestones || [];
@@ -137,7 +143,7 @@ export function EnsembleProbabilityTrendChart({
     return `${homePath} L ${lastX} ${bottomY} L ${firstX} ${bottomY} Z`;
   }, [homePath, points, innerHeight]);
 
-  // Ingest on-demand updated source simulation
+  // Ingest on-demand updated source into prediction ledger (requires admin session)
   const handleTriggerIngest = async (sourceType: 'BREAKING_ABSENCE' | 'MARKET_ODDS_SHIFT' | 'LINEUP_CONFIRMED') => {
     const targetId = matchId || activeTrend.matchId;
     if (!targetId) {
@@ -145,27 +151,53 @@ export function EnsembleProbabilityTrendChart({
       return;
     }
 
+    const hOdds = Number(customOddsHome);
+    const dOdds = Number(customOddsDraw);
+    const aOdds = Number(customOddsAway);
+
+    if (sourceType === 'MARKET_ODDS_SHIFT') {
+      if (!Number.isFinite(hOdds) || hOdds <= 1.01 || !Number.isFinite(dOdds) || dOdds <= 1.01 || !Number.isFinite(aOdds) || aOdds <= 1.01) {
+        setIngestNotice('Enter genuine decimal 1X2 market quotes (> 1.01 for Home, Draw, Away) before logging a market shift.');
+        return;
+      }
+    }
+
+    const token = await getIdToken();
+    if (!token) {
+      setIngestNotice('Admin sign-in required to commit manual evidence milestones.');
+      return;
+    }
+
     try {
       setIngestingSource(true);
       setIngestNotice(`Ingesting ${sourceType.replace(/_/g, ' ')} feed into evidence snapshot...`);
 
-      const res = await fetch('/api/predict/ingest-source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          matchId: targetId,
-          sourceType,
-          absenceTeam: 'AWAY',
-          absencePlayer: sourceType === 'BREAKING_ABSENCE' ? 'Key Starting Center-Back' : undefined,
-          marketOddsHome: sourceType === 'MARKET_ODDS_SHIFT' ? 1.78 : undefined,
-          marketOddsDraw: sourceType === 'MARKET_ODDS_SHIFT' ? 3.60 : undefined,
-          marketOddsAway: sourceType === 'MARKET_ODDS_SHIFT' ? 4.50 : undefined,
-          notes: `Real-time user trigger: Ingested ${sourceType} into calibrated multi-model ledger.`,
-        }),
-      });
+      const res = await ErrorReportingService.apiFetch(
+        '/api/predict/ingest-source',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            matchId: targetId,
+            sourceType,
+            absenceTeam: 'AWAY',
+            absencePlayer: sourceType === 'BREAKING_ABSENCE' ? 'Confirmed Key Starter Absence' : undefined,
+            marketOddsHome: sourceType === 'MARKET_ODDS_SHIFT' ? hOdds : undefined,
+            marketOddsDraw: sourceType === 'MARKET_ODDS_SHIFT' ? dOdds : undefined,
+            marketOddsAway: sourceType === 'MARKET_ODDS_SHIFT' ? aOdds : undefined,
+            notes: `Admin evidence trigger: Ingested ${sourceType} into calibrated multi-model ledger.`,
+          }),
+        },
+        { source: 'EnsembleProbabilityTrendChart.handleIngestSource' }
+      );
 
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Ingest failed');
+      if (!res.ok) {
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
 
       if (data.trend) {
         setCustomTrend(data.trend);
@@ -276,17 +308,19 @@ export function EnsembleProbabilityTrendChart({
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <div className="bg-slate-950 p-3.5 rounded-2xl border border-slate-800">
           <div className="flex items-center justify-between">
-            <span className="text-[11px] font-mono text-slate-400">Baseline Elo Prior</span>
-            <span className="text-[10px] text-slate-500 font-mono">T-48h</span>
+            <span className="text-[11px] font-mono text-slate-400">Initial Ledger Baseline</span>
+            <span className="text-[10px] text-slate-500 font-mono">
+              {milestones[0]?.relativeTime || 'No Prior'}
+            </span>
           </div>
           <div className="flex items-baseline gap-2 mt-1">
             <span className="text-lg font-black text-white font-mono">
-              {(activeTrend.baselineEnsemble.homeWin * 100).toFixed(1)}%
+              {milestones.length > 0 ? `${(activeTrend.baselineEnsemble.homeWin * 100).toFixed(1)}%` : '—'}
             </span>
             <span className="text-xs text-slate-400 font-mono">Home Win</span>
           </div>
           <span className="text-[10px] text-slate-500 block mt-0.5">
-            Initial season ratings &amp; league priors
+            {milestones.length > 0 ? 'First sealed ledger snapshot' : 'Awaiting initial prediction snapshot'}
           </span>
         </div>
 
@@ -360,7 +394,16 @@ export function EnsembleProbabilityTrendChart({
           </span>
         </div>
 
-        {/* SVG Canvas */}
+        {/* Empty state or SVG Canvas */}
+        {milestones.length === 0 ? (
+          <div className="py-12 text-center text-slate-400 space-y-2">
+            <Info className="w-6 h-6 text-slate-500 mx-auto" />
+            <p className="text-xs font-semibold text-slate-300">No prediction ledger snapshots recorded yet.</p>
+            <p className="text-[11px] text-slate-500 max-w-md mx-auto">
+              Only genuine persisted entries from the PostgreSQL prediction ledger are plotted here.
+            </p>
+          </div>
+        ) : (
         <div className="w-full overflow-x-auto scrollbar-none">
           <svg
             viewBox={`0 0 ${chartWidth} ${chartHeight}`}
@@ -563,6 +606,7 @@ export function EnsembleProbabilityTrendChart({
             })}
           </svg>
         </div>
+        )}
       </div>
 
       {/* Selected Milestone Inspection Dossier Card */}
@@ -713,29 +757,61 @@ export function EnsembleProbabilityTrendChart({
           <button
             onClick={() => handleTriggerIngest('BREAKING_ABSENCE')}
             disabled={ingestingSource}
-            className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700/80 hover:border-emerald-500/60 rounded-xl text-xs font-semibold transition-all inline-flex items-center gap-1.5 shadow-sm"
+            className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700/80 hover:border-emerald-500/60 rounded-xl text-xs font-semibold transition-all inline-flex items-center gap-1.5 shadow-sm cursor-pointer disabled:opacity-50"
           >
             <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
-            + Ingest Key Absence (-0.32 xGA)
-          </button>
-
-          <button
-            onClick={() => handleTriggerIngest('MARKET_ODDS_SHIFT')}
-            disabled={ingestingSource}
-            className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700/80 hover:border-emerald-500/60 rounded-xl text-xs font-semibold transition-all inline-flex items-center gap-1.5 shadow-sm"
-          >
-            <TrendingUp className="w-3.5 h-3.5 text-emerald-400" />
-            + Ingest Sharp Market Move (1.78 Odds)
+            + Log Absence Impact
           </button>
 
           <button
             onClick={() => handleTriggerIngest('LINEUP_CONFIRMED')}
             disabled={ingestingSource}
-            className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700/80 hover:border-emerald-500/60 rounded-xl text-xs font-semibold transition-all inline-flex items-center gap-1.5 shadow-sm"
+            className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700/80 hover:border-emerald-500/60 rounded-xl text-xs font-semibold transition-all inline-flex items-center gap-1.5 shadow-sm cursor-pointer disabled:opacity-50"
           >
             <CheckCircle2 className="w-3.5 h-3.5 text-cyan-400" />
-            + Ingest Confirmed XI Lineup
+            + Log Confirmed XI Lineup
           </button>
+
+          <div className="flex flex-wrap items-center gap-1.5 bg-slate-900/90 border border-slate-800 rounded-xl px-2.5 py-1">
+            <input
+              type="number"
+              step="0.01"
+              min="1.02"
+              placeholder="H"
+              value={customOddsHome}
+              onChange={(e) => setCustomOddsHome(e.target.value)}
+              className="w-14 bg-slate-950 border border-slate-800 rounded px-1.5 py-0.5 text-[11px] font-mono text-white"
+              title="Home Decimal Odds"
+            />
+            <input
+              type="number"
+              step="0.01"
+              min="1.02"
+              placeholder="D"
+              value={customOddsDraw}
+              onChange={(e) => setCustomOddsDraw(e.target.value)}
+              className="w-14 bg-slate-950 border border-slate-800 rounded px-1.5 py-0.5 text-[11px] font-mono text-white"
+              title="Draw Decimal Odds"
+            />
+            <input
+              type="number"
+              step="0.01"
+              min="1.02"
+              placeholder="A"
+              value={customOddsAway}
+              onChange={(e) => setCustomOddsAway(e.target.value)}
+              className="w-14 bg-slate-950 border border-slate-800 rounded px-1.5 py-0.5 text-[11px] font-mono text-white"
+              title="Away Decimal Odds"
+            />
+            <button
+              onClick={() => handleTriggerIngest('MARKET_ODDS_SHIFT')}
+              disabled={ingestingSource}
+              className="px-2.5 py-1 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 rounded-lg text-xs font-semibold transition-all inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+            >
+              <TrendingUp className="w-3.5 h-3.5 text-emerald-400" />
+              Log 1X2 Quotes
+            </button>
+          </div>
         </div>
       </div>
 

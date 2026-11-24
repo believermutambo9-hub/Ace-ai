@@ -14,9 +14,9 @@
 
 import { MonteCarloSimulator, MonteCarloResult } from '../simulation/monteCarlo.ts';
 import { ProbabilityCalibrator } from '../calibration/calibrator.ts';
-import { ClvEngine, ValueBetAnalysis, MarketOddsInput } from './clv/clvEngine.ts';
-import { LineupImpactEngine, PlayerAbsenceItem, LineupImpactResult } from './player/lineupEngine.ts';
-import { AdvancedMetricsEngine, AdvancedMetricsResult, TeamContextFactors } from './spatial/advancedMetrics.ts';
+import { ClvEngine, type ValueBetAnalysis, type MarketOddsInput } from './clv/clvEngine.ts';
+import { LineupImpactEngine, type PlayerAbsenceItem, type LineupImpactResult } from './player/lineupEngine.ts';
+import { AdvancedMetricsEngine, type AdvancedMetricsResult, type TeamContextFactors } from './spatial/advancedMetrics.ts';
 
 export interface PredictionResult {
   match: {
@@ -80,6 +80,7 @@ export interface PredictionResult {
     score: number;
     rating: 'EXCELLENT' | 'GOOD' | 'MODERATE' | 'LIMITED';
     factors: string[];
+    missingInputs?: string[];
   };
   confidence: {
     level: 'HIGH' | 'MEDIUM' | 'LOW';
@@ -120,14 +121,14 @@ export class PredictionEngine {
   public static readonly VERSION = 'football-engine-v2.5-institutional';
 
   /**
-   * Run end-to-end multi-model estimation, lineup adjustments, Monte Carlo runs, and CLV analysis
+   * Run end-to-end multi-model estimation, lineup adjustments, Monte Carlo runs, and real CLV analysis
    */
   public static calculatePrediction(params: {
     homeTeam: string;
     awayTeam: string;
     competition: string;
     venue?: string;
-    kickoffTime: Date;
+    kickoffTime?: Date | string;
     homeElo?: number;
     awayElo?: number;
     homeAttack?: number;
@@ -141,8 +142,13 @@ export class PredictionEngine {
     marketOdds?: MarketOddsInput;
     homeContext?: TeamContextFactors;
     awayContext?: TeamContextFactors;
+    hasTeamRatings?: boolean;
+    hasWebIntelligence?: boolean;
+    webIntelligenceReliability?: number;
   }): PredictionResult {
-    let homeElo = params.homeElo ?? 1550;
+    const hasRatings =
+      params.hasTeamRatings ?? (params.homeElo !== undefined && params.awayElo !== undefined);
+    let homeElo = params.homeElo ?? 1500;
     let awayElo = params.awayElo ?? 1500;
     const homeAdvantage = 65;
 
@@ -219,7 +225,7 @@ export class PredictionEngine {
     const normDcDraw = dcDraw / dcTotal;
     const normDcAway = dcAwayWin / dcTotal;
 
-    // 6. Model D: xG Projection
+    // 6. Model D: Goal Projection Logistic Blend
     const homeXg = params.homeXgAvg ?? lambdaHome;
     const awayXg = params.awayXgAvg ?? muAway;
     const xgHomeWin = 1 / (1 + Math.exp(-(homeXg - awayXg) * 1.5));
@@ -234,21 +240,21 @@ export class PredictionEngine {
     });
 
     // 8. Model Ensemble
-    let finalHome =
+    const finalHome =
       0.30 * normDcHome +
       0.25 * mcResult.probabilities.homeWin +
       0.20 * eloHomeWin +
       0.15 * pHomeWin +
       0.10 * xgHomeWin;
 
-    let finalDraw =
+    const finalDraw =
       0.30 * normDcDraw +
       0.25 * mcResult.probabilities.draw +
       0.20 * eloDraw +
       0.15 * pDraw +
       0.10 * xgDraw;
 
-    let finalAway =
+    const finalAway =
       0.30 * normDcAway +
       0.25 * mcResult.probabilities.awayWin +
       0.20 * eloAwayWin +
@@ -263,47 +269,85 @@ export class PredictionEngine {
     const fairDraw = Number((1 / Math.max(0.01, calibrated.drawCalibrated)).toFixed(2));
     const fairAway = Number((1 / Math.max(0.01, calibrated.awayCalibrated)).toFixed(2));
 
-    // 10. CLV / Value Analysis if Market Odds provided
-    const defaultMarketOdds: MarketOddsInput = params.marketOdds || {
-      homeOdds: Number((fairHome * 0.95).toFixed(2)),
-      drawOdds: Number((fairDraw * 0.95).toFixed(2)),
-      awayOdds: Number((fairAway * 0.95).toFixed(2)),
-    };
-    const valueAnalysis = ClvEngine.analyzeMarket(
-      {
-        homeWin: calibrated.homeCalibrated,
-        draw: calibrated.drawCalibrated,
-        awayWin: calibrated.awayCalibrated,
-      },
-      defaultMarketOdds
-    );
+    // 10. CLV / Value Analysis ONLY when real bookmaker odds are supplied
+    const valueAnalysis = params.marketOdds
+      ? ClvEngine.analyzeMarket(
+          {
+            homeWin: calibrated.homeCalibrated,
+            draw: calibrated.drawCalibrated,
+            awayWin: calibrated.awayCalibrated,
+          },
+          params.marketOdds
+        )
+      : undefined;
 
-    // Data Quality Assessment
-    const sampleSize = params.sampleMatchesCount ?? 15;
-    let qualityScore = 0.96;
+    // Empirical Data Quality & Missing Inputs Assessment
+    const sampleSize = Math.max(0, params.sampleMatchesCount ?? 0);
+    const hasWebIntel = Boolean(params.hasWebIntelligence);
+    const webRel = Math.max(0, Math.min(1, params.webIntelligenceReliability ?? (hasWebIntel ? 0.65 : 0)));
+    const hasMarketOdds = Boolean(params.marketOdds);
+
     const qualityFactors: string[] = [
-      'Official competition fixture and venue confirmed',
-      'Dynamic Elo rating updated with venue strength',
-      '5,000 Monte Carlo simulations executed',
-      'Dixon-Coles bivariate low-score tau correlation applied',
-      'Non-penalty xG (npxG) & pitch tilt contextual adjustments incorporated',
+      '5,000 Monte Carlo iterations & Dixon-Coles bivariate distribution executed',
     ];
+    const missingInputs: string[] = [];
 
-    if (params.absences && params.absences.length > 0) {
-      qualityFactors.push(`Starting lineup absence delta applied (${params.absences.length} squad factors)`);
+    if (hasRatings) {
+      qualityFactors.push('Pre-match Elo & attack/defense ratings derived from historical results');
+    } else {
+      missingInputs.push('Club historical Elo/strength ratings unavailable (neutral 1500 baseline used)');
     }
 
-    const modelAgreement = 1 - Math.abs(eloHomeWin - normDcHome);
+    if (sampleSize >= 10) {
+      qualityFactors.push(`${sampleSize} prior team matches sampled before kickoff`);
+    } else if (sampleSize > 0) {
+      qualityFactors.push(`Small historical sample (${sampleSize} prior matches sampled)`);
+      missingInputs.push(`Limited match history sample (${sampleSize} matches; < 10 recommended)`);
+    } else {
+      missingInputs.push('Zero prior completed matches found for form/H2H calibration');
+    }
+
+    if (params.absences && params.absences.length > 0) {
+      qualityFactors.push(`Lineup/absence adjustments applied (${params.absences.length} squad factors)`);
+    } else if (hasWebIntel) {
+      qualityFactors.push('Pre-match web/fixture intelligence checked');
+    } else {
+      missingInputs.push('Verified live injury/lineup feed unavailable');
+    }
+
+    if (hasMarketOdds) {
+      qualityFactors.push('Real bookmaker odds integrated for edge analysis');
+    } else {
+      missingInputs.push('No external bookmaker odds quote in database');
+    }
+
+    const rawQuality =
+      0.22 +
+      Math.min(0.32, (sampleSize / 20) * 0.32) +
+      (hasRatings ? 0.26 : 0.04) +
+      (hasWebIntel ? webRel * 0.10 : 0) +
+      (hasMarketOdds ? 0.10 : 0);
+
+    const qualityScore = Number(Math.max(0.18, Math.min(0.98, rawQuality)).toFixed(2));
+    let qualityRating: 'EXCELLENT' | 'GOOD' | 'MODERATE' | 'LIMITED' = 'LIMITED';
+    if (qualityScore >= 0.80) qualityRating = 'EXCELLENT';
+    else if (qualityScore >= 0.65) qualityRating = 'GOOD';
+    else if (qualityScore >= 0.45) qualityRating = 'MODERATE';
+
+    const modelAgreement = Math.max(0.3, Math.min(1, 1 - Math.abs(eloHomeWin - normDcHome)));
     const confidenceScore = Number((qualityScore * modelAgreement).toFixed(3));
     let confLevel: 'HIGH' | 'MEDIUM' | 'LOW' = 'MEDIUM';
-    let confReason = 'Strong agreement across Elo, Dixon-Coles, and Monte Carlo.';
+    let confReason = 'Moderate data coverage and statistical agreement across Elo, Dixon-Coles, and Monte Carlo.';
 
-    if (confidenceScore > 0.82) {
+    if (confidenceScore >= 0.78 && qualityRating === 'EXCELLENT') {
       confLevel = 'HIGH';
-      confReason = 'High data completeness with high agreement across statistical and simulation models.';
-    } else if (confidenceScore < 0.65) {
+      confReason = 'Strong historical sample and model convergence across Elo, Dixon-Coles, and Monte Carlo.';
+    } else if (confidenceScore < 0.55 || qualityRating === 'LIMITED' || sampleSize === 0) {
       confLevel = 'LOW';
-      confReason = 'Elevated variance between models or restricted historical sample.';
+      confReason =
+        missingInputs.length > 0
+          ? `Restricted confidence: ${missingInputs[0]}.`
+          : 'Elevated variance between models or restricted historical sample.';
     }
 
     return {
@@ -312,7 +356,11 @@ export class PredictionEngine {
         awayTeam: params.awayTeam,
         competition: params.competition,
         venue: params.venue,
-        kickoffTime: params.kickoffTime.toISOString(),
+        kickoffTime: params.kickoffTime
+          ? (params.kickoffTime instanceof Date
+              ? params.kickoffTime.toISOString()
+              : new Date(params.kickoffTime).toISOString())
+          : new Date().toISOString(),
       },
       prediction: {
         homeWin: calibrated.homeCalibrated,
@@ -382,8 +430,9 @@ export class PredictionEngine {
       },
       dataQuality: {
         score: qualityScore,
-        rating: 'EXCELLENT',
+        rating: qualityRating,
         factors: qualityFactors,
+        missingInputs,
       },
       confidence: {
         level: confLevel,
